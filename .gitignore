@@ -1,0 +1,69 @@
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment / local secrets
+.env
+.env.*
+!.env.example
+
+# Rust
+target/
+**/target/
+
+# Node / frontend
+node_modules/
+**/node_modules/
+dist/
+build/
+coverage/
+.next/
+out/
+*.tsbuildinfo
+
+# Tauri build artifacts
+src-tauri/gen/
+**/src-tauri/gen/
+*.app
+*.dmg
+*.pkg
+*.msi
+*.deb
+*.AppImage
+
+# Android
+.gradle/
+**/.gradle/
+local.properties
+*.keystore
+*.jks
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# iOS / Xcode
+DerivedData/
+
+# Runtime temp/cache
+tmp/
+temp/
+.cache/
+*.tmp
+
+# Local model assets (keep manifests tracked)
+models/downloads/
+models/cache/
+models/runtime/
