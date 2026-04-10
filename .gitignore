@@ -26,12 +26,16 @@ target/
 # Node / frontend
 node_modules/
 **/node_modules/
+.pnpm-store/
 dist/
 build/
 coverage/
 .next/
 out/
 *.tsbuildinfo
+!apps/desktop/ui/dist/
+apps/desktop/ui/dist/*
+!apps/desktop/ui/dist/.gitkeep
 
 # Tauri build artifacts
 src-tauri/gen/

@@ -1,0 +1,13 @@
+{
+  "name": "kiku",
+  "private": true,
+  "packageManager": "pnpm@10.8.1",
+  "scripts": {
+    "start": "pnpm --dir apps/desktop dev",
+    "dev": "pnpm start",
+    "ui:dev": "pnpm --dir apps/desktop/ui dev",
+    "ui:build": "pnpm --dir apps/desktop/ui build",
+    "bundle:prototype": "pnpm bundle:mac:prototype",
+    "bundle:mac:prototype": "pnpm --dir apps/desktop build"
+  }
+}

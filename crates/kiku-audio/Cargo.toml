@@ -1,0 +1,9 @@
+[package]
+name = "kiku-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kiku-platform = { path = "../kiku-platform" }
+serde.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "kiku-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+whisper-rs = "0.11"

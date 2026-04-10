@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kiku",
+  "version": "0.1.0",
+  "identifier": "com.kiku.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm --dir ./ui dev",
+    "beforeBuildCommand": "pnpm --dir ./ui build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Kiku",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 980,
+        "minHeight": 680,
+        "resizable": true,
+        "alwaysOnTop": true,
+        "transparent": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "infoPlist": "Info.plist"
+    }
+  }
+}

@@ -59,6 +59,7 @@ These are intentionally out of scope for the first shipping version:
 - Cloud ASR or cloud translation
 - Speaker diarization with reliable person identity tracking
 - Full transcript editor inside the app
+- Full typed "Speak Mode" (text translate + TTS playback) implementation
 - Multi-language packs beyond English and Japanese
 - iOS support in v1
 - Intel Mac support in v1
@@ -134,6 +135,7 @@ These are intentionally out of scope for the first shipping version:
 - Movable and resizable
 - Optional transparency
 - Live controls in the top bar
+- Mode tabs in top bar: `Listen` and `Speak` (Speak is planned, not in current MVP)
 - Secondary settings menu for less frequently used options
 
 ### Transcript behavior
@@ -322,6 +324,15 @@ Swift plugin(s) for ScreenCaptureKit and permission-sensitive integrations.
 2. User changes font size, color, theme, transparency, or other preferences.
 3. Settings apply immediately where possible.
 4. Settings persist across launches.
+
+### Flow E: Planned Speak mode (post-MVP, discovery required)
+1. User switches to the `Speak` tab.
+2. User types source text (for example English).
+3. User clicks `Translate`.
+4. App shows translated output text below the source text (for example Japanese).
+5. User clicks `Play`.
+6. App speaks the translated text using local/offline TTS voice in the target language/accent.
+7. User can revise source text and replay as needed.
 
 ---
 
@@ -523,6 +534,10 @@ Kiku should behave like a floating utility window that sits beside or above a me
 - optional transparency
 
 ### Main visible regions
+0. **Mode tabs (planned)**
+   - `Listen` tab for live audio captioning
+   - `Speak` tab for typed translation + TTS playback (planned, post-MVP)
+
 1. **Top control bar**
    - Start/Stop Listening
    - Mic toggle
@@ -557,6 +572,15 @@ Kiku should behave like a floating utility window that sits beside or above a me
 - Caption readability matters more than flashy visuals.
 - Visual widget should be decorative but also informative.
 - Settings should not clutter the main live-reading experience.
+
+### Planned Speak mode note (discussion required before build)
+Speak mode is approved as a planned feature direction, but it must not be implemented until a focused discovery pass defines:
+- exact UX layout and tab behavior
+- translation engine path for typed input
+- local TTS runtime/provider and voice asset strategy
+- latency, quality, and privacy acceptance criteria
+- export/history behavior (if any)
+- platform parity expectations (macOS first vs Android timing)
 
 ---
 
@@ -616,6 +640,20 @@ Do not bundle the heaviest model directly in the smallest base installer.
 3. Install model pack locally.
 4. Allow future local model updates when not listening.
 
+### Current prototype status (April 9, 2026)
+- App checks for a local Whisper model on startup.
+- If no model is found, session state is `Model Missing`, `Start Listening` is disabled, and a model-manager modal is shown in-app.
+- Model-manager modal supports model options with stats (size, approximate WER, best use), install progress, activation, and deletion.
+- Model-manager catalog now includes both installable runtime options and planned non-Whisper candidate models, with clear `Available Now` vs `Planned` status badges.
+- Each model card now shows clearer decision metadata (model family, language focus, latency profile, accuracy hint/WER context, and intent note) to reduce guesswork when selecting.
+- Model-manager modal now includes active download cancel controls; closing (`Done`/`Later`) is disabled while download is active.
+- Main top bar includes active-model selection and direct access to the model manager.
+- On successful install or activation, the app transitions to `Ready` without requiring terminal commands.
+- Model activation/install flow now guards against duplicate `Downloading Model` transitions to avoid stuck setup states.
+- `Start Listening` is disabled when all audio sources are off, or when no installed model is available.
+- If no model is installed, the transcript panel is visually locked with an in-app message directing users to the model manager.
+- Language controls now include one-click input/output swap, and EN -> JA is enabled for prototype testing via local fallback translation logic.
+
 ### Requirements
 - versioned model manifests
 - integrity checks
@@ -651,6 +689,8 @@ Possible optimizations include:
 - avoid excessive buffering
 - incremental caption updates
 - preserve readability while preventing flicker
+- run ASR inference off the UI control path so `Stop Listening` and other controls remain responsive during heavy transcription
+- reuse loaded ASR model context across inferences instead of reloading the model for each chunk
 
 ---
 
@@ -767,6 +807,12 @@ Add a separate reviewer-oriented document later covering:
 - mic-only flow
 - mobile-safe UI layout
 - model install on Android
+
+### Phase 6: Speak mode (planned, post-discovery)
+- add `Listen` vs `Speak` tab shell
+- implement typed text translation workflow
+- implement local TTS playback controls
+- finalize UX after discovery decisions
 
 ---
 
@@ -891,6 +937,10 @@ These do not block the design plan but will need decisions during implementation
 4. Exact local storage paths for models and settings per platform
 5. Exact visual style for the confidence/activity widget
 6. Whether dual-source simultaneous processing should be mixed, interleaved, or independently chunked before merge
+7. Speak mode information architecture: single-window tabs vs separate panel/window
+8. Speak mode translation backend choice and whether it reuses ASR translation stack or separate MT path
+9. Speak mode TTS backend/runtime and local voice asset packaging/update strategy
+10. Speak mode privacy/logging policy for typed input and playback history
 
 ---
 

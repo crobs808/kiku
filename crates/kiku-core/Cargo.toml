@@ -1,0 +1,16 @@
+[package]
+name = "kiku-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kiku-asr = { path = "../kiku-asr" }
+kiku-models = { path = "../kiku-models" }
+kiku-platform = { path = "../kiku-platform" }
+kiku-privacy = { path = "../kiku-privacy" }
+kiku-settings = { path = "../kiku-settings" }
+kiku-transcript = { path = "../kiku-transcript" }
+kiku-translate = { path = "../kiku-translate" }
+serde.workspace = true
+thiserror.workspace = true

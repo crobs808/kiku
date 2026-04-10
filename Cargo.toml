@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/desktop/src-tauri",
+  "crates/kiku-audio",
+  "crates/kiku-asr",
+  "crates/kiku-core",
+  "crates/kiku-models",
+  "crates/kiku-platform",
+  "crates/kiku-privacy",
+  "crates/kiku-settings",
+  "crates/kiku-transcript",
+  "crates/kiku-translate",
+  "crates/kiku-visualizer",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "GPL-3.0-only"
+authors = ["Kiku Contributors"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
