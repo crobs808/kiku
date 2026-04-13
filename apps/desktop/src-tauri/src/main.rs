@@ -87,7 +87,7 @@ impl ModelPackage {
     }
 }
 
-const MODEL_PACKAGES: [ModelPackage; 8] = [
+const MODEL_PACKAGES: [ModelPackage; 10] = [
     ModelPackage {
         id: "large-v3",
         name: "Whisper Large v3",
@@ -105,6 +105,24 @@ const MODEL_PACKAGES: [ModelPackage; 8] = [
         recommended: true,
     },
     ModelPackage {
+        id: "large-v3-turbo",
+        name: "Whisper Large v3 Turbo",
+        family: "Whisper.cpp",
+        filename: Some("ggml-large-v3-turbo.bin"),
+        url: Some(
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+        ),
+        size: "1.6 GB",
+        approx_wer: "~5.6%",
+        latency: "Fast high-quality preset",
+        language_focus: "Multilingual with better speed",
+        best_for: "Lower-latency meetings while keeping high translation quality",
+        notes: "Recommended when Large v3 quality is needed with faster response.",
+        availability: ModelAvailability::AvailableNow,
+        downloadable: true,
+        recommended: false,
+    },
+    ModelPackage {
         id: "medium",
         name: "Whisper Medium",
         family: "Whisper.cpp",
@@ -116,6 +134,24 @@ const MODEL_PACKAGES: [ModelPackage; 8] = [
         language_focus: "Japanese + English",
         best_for: "Balanced option for long meetings on most Macs",
         notes: "Good fallback when Large v3 feels too heavy.",
+        availability: ModelAvailability::AvailableNow,
+        downloadable: true,
+        recommended: false,
+    },
+    ModelPackage {
+        id: "distil-large-v3",
+        name: "Distil-Whisper Large v3",
+        family: "Distil-Whisper (GGML)",
+        filename: Some("ggml-distil-large-v3.bin"),
+        url: Some(
+            "https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin",
+        ),
+        size: "1.5 GB",
+        approx_wer: "~5.8% (English benchmark)",
+        latency: "Very fast large-model class",
+        language_focus: "English-heavy meetings / mixed content",
+        best_for: "Fast long meetings where low latency is critical",
+        notes: "Runs through Whisper-compatible runtime with strong speed gains.",
         availability: ModelAvailability::AvailableNow,
         downloadable: true,
         recommended: false,
@@ -154,18 +190,20 @@ const MODEL_PACKAGES: [ModelPackage; 8] = [
     },
     ModelPackage {
         id: "kotoba-whisper-v2",
-        name: "Kotoba-Whisper v2 (Candidate)",
+        name: "Kotoba-Whisper v2.0",
         family: "Kotoba / Whisper family",
-        filename: None,
-        url: None,
-        size: "~3-4 GB (varies by package)",
-        approx_wer: "N/A in current build",
-        latency: "Expected medium-high",
+        filename: Some("ggml-kotoba-whisper-v2.0.bin"),
+        url: Some(
+            "https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0-ggml/resolve/main/ggml-kotoba-whisper-v2.0.bin",
+        ),
+        size: "3.1 GB",
+        approx_wer: "~5.0% (JP-focused estimate)",
+        latency: "Medium-high",
         language_focus: "Japanese-focused ASR",
-        best_for: "Future Japanese-heavy transcription quality",
-        notes: "Planned integration target for stronger Japanese specialization.",
-        availability: ModelAvailability::Planned,
-        downloadable: false,
+        best_for: "Japanese-heavy meetings where Whisper variants miss terms",
+        notes: "GGML Whisper-compatible Japanese-specialized model.",
+        availability: ModelAvailability::AvailableNow,
+        downloadable: true,
         recommended: false,
     },
     ModelPackage {
@@ -419,7 +457,7 @@ fn delete_model(
     state: State<DesktopState>,
     model_id: String,
 ) -> Result<Vec<ModelInventoryItem>, String> {
-    ensure_model_mutation_allowed(&state)?;
+    ensure_model_delete_allowed(&state)?;
 
     let package = find_model_package(&model_id)
         .ok_or_else(|| format!("unknown model option '{model_id}'"))?;
@@ -517,17 +555,21 @@ fn start_model_download(
         download.cancel_requested = false;
     }
 
-    if let Err(error) = with_controller(&state, |controller| controller.begin_model_install()) {
-        let mut download = state
-            .model_download
-            .lock()
-            .map_err(|_| "model download lock poisoned".to_owned())?;
-        download.in_progress = false;
-        download.progress = 0.0;
-        download.downloaded_bytes = 0;
-        download.total_bytes = None;
-        download.last_error = Some(error.clone());
-        return Err(error);
+    let session_state =
+        with_controller(&state, |controller| Ok(controller.session_snapshot().state))?;
+    if session_state != SessionState::Listening {
+        if let Err(error) = with_controller(&state, |controller| controller.begin_model_install()) {
+            let mut download = state
+                .model_download
+                .lock()
+                .map_err(|_| "model download lock poisoned".to_owned())?;
+            download.in_progress = false;
+            download.progress = 0.0;
+            download.downloaded_bytes = 0;
+            download.total_bytes = None;
+            download.last_error = Some(error.clone());
+            return Err(error);
+        }
     }
 
     let controller = Arc::clone(&state.controller);
@@ -570,10 +612,12 @@ fn start_model_download(
                 }
 
                 if let Ok(mut controller) = controller.lock() {
-                    if has_installed_models {
-                        controller.recover_ready();
-                    } else {
-                        controller.mark_model_missing();
+                    if controller.session_snapshot().state == SessionState::DownloadingModel {
+                        if has_installed_models {
+                            controller.recover_ready();
+                        } else {
+                            controller.mark_model_missing();
+                        }
                     }
                 }
             }
@@ -707,15 +751,18 @@ fn activate_installed_model(
         .map_err(|_| "controller lock poisoned".to_owned())?;
     controller.set_asr_runtime(Arc::new(runtime));
     let current_state = controller.session_snapshot().state;
-    if current_state != SessionState::DownloadingModel {
-        controller
-            .begin_model_install()
-            .map_err(|error| error.to_string())?;
+    match current_state {
+        SessionState::DownloadingModel => {
+            controller
+                .complete_model_install()
+                .map(|_| ())
+                .map_err(|error| error.to_string())?;
+        }
+        SessionState::ModelMissing => {
+            controller.recover_ready();
+        }
+        _ => {}
     }
-    controller
-        .complete_model_install()
-        .map(|_| ())
-        .map_err(|error| error.to_string())?;
     std::env::set_var("KIKU_WHISPER_MODEL", model_path);
     Ok(())
 }
@@ -804,13 +851,30 @@ fn ensure_model_mutation_allowed(state: &State<DesktopState>) -> Result<(), Stri
     let snapshot = with_controller(state, |controller| Ok(controller.session_snapshot()))?;
     if matches!(
         snapshot.state,
-        SessionState::Listening
-            | SessionState::Stopping
+        SessionState::Stopping
             | SessionState::PromptingSaveDiscard
             | SessionState::SavingTranscript
     ) {
-        return Err("stop listening before changing models".to_owned());
+        return Err("finish stop/save flow before changing models".to_owned());
     }
+    Ok(())
+}
+
+fn ensure_model_delete_allowed(state: &State<DesktopState>) -> Result<(), String> {
+    ensure_model_mutation_allowed(state)?;
+    let snapshot = with_controller(state, |controller| Ok(controller.session_snapshot()))?;
+    if snapshot.state == SessionState::Listening {
+        return Err("stop listening before deleting models".to_owned());
+    }
+
+    let download = state
+        .model_download
+        .lock()
+        .map_err(|_| "model download lock poisoned".to_owned())?;
+    if download.in_progress {
+        return Err("wait for model download to finish before deleting models".to_owned());
+    }
+
     Ok(())
 }
 

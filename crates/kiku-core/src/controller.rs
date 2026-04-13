@@ -9,6 +9,7 @@ use kiku_settings::{
 use kiku_transcript::{SourceIcon, TranscriptBuffer};
 use kiku_translate::{Language as TranslationLanguage, StubTranslator, Translator};
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ const MAX_AUDIO_BUFFER_SECS: usize = 10;
 const DRAIN_PER_POLL_SECS: usize = 2;
 const SILENCE_RMS_THRESHOLD: f32 = 0.010;
 const RETAIN_TAIL_SECS: usize = 2;
+const INFERENCE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Serialize)]
 pub struct SessionSnapshot {
@@ -76,18 +78,18 @@ pub struct AppController {
     privacy: Arc<dyn PrivacyGuard>,
     translator: Arc<dyn Translator>,
     transcript: TranscriptBuffer,
-    live_audio_samples: Vec<f32>,
+    live_audio_samples: VecDeque<f32>,
     live_sample_rate_hz: u32,
     source_language: Language,
     target_language: Language,
     listening_started_at: Option<Instant>,
     last_infer_at: Option<Instant>,
     last_emitted_normalized: Option<String>,
-    pending_inference: Option<PendingInference>,
-}
-
-struct PendingInference {
-    receiver: Receiver<Result<AsrOutput, AsrError>>,
+    pending_inference: bool,
+    inference_request_tx: Option<mpsc::Sender<AsrRequest>>,
+    inference_result_rx: Option<Receiver<Result<AsrOutput, AsrError>>>,
+    inference_stop_tx: Option<mpsc::Sender<()>>,
+    inference_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AppController {
@@ -107,14 +109,18 @@ impl AppController {
             privacy,
             translator: Arc::new(StubTranslator::default()),
             transcript: TranscriptBuffer::default(),
-            live_audio_samples: Vec::new(),
+            live_audio_samples: VecDeque::new(),
             live_sample_rate_hz: 16_000,
             source_language: Language::Japanese,
             target_language: Language::English,
             listening_started_at: None,
             last_infer_at: None,
             last_emitted_normalized: None,
-            pending_inference: None,
+            pending_inference: false,
+            inference_request_tx: None,
+            inference_result_rx: None,
+            inference_stop_tx: None,
+            inference_worker: None,
         }
     }
 
@@ -157,7 +163,8 @@ impl AppController {
         self.listening_started_at = Some(Instant::now());
         self.last_infer_at = None;
         self.last_emitted_normalized = None;
-        self.pending_inference = None;
+        self.pending_inference = false;
+        self.start_inference_worker();
 
         Ok(self.session_snapshot())
     }
@@ -185,6 +192,11 @@ impl AppController {
 
     pub fn set_asr_runtime(&mut self, runtime: Arc<dyn AsrRuntime>) {
         self.asr = runtime;
+        if self.session.state() == SessionState::Listening {
+            self.pending_inference = false;
+            self.last_infer_at = None;
+            self.start_inference_worker();
+        }
     }
 
     pub fn language_config(&self) -> LanguageConfig {
@@ -312,14 +324,18 @@ impl AppController {
 
         let max_buffer_samples = sample_rate_hz as usize * MAX_AUDIO_BUFFER_SECS;
         if self.live_audio_samples.len() > max_buffer_samples {
-            let overflow = self.live_audio_samples.len() - max_buffer_samples;
-            self.live_audio_samples.drain(..overflow);
+            trim_to_tail(&mut self.live_audio_samples, max_buffer_samples);
         }
 
-        if let Some(pending) = &self.pending_inference {
-            match pending.receiver.try_recv() {
+        if self.pending_inference {
+            let result_rx = self.inference_result_rx.as_ref().ok_or_else(|| {
+                CoreError::Asr(AsrError::InferenceFailed(
+                    "asr worker is not initialized".to_owned(),
+                ))
+            })?;
+            match result_rx.try_recv() {
                 Ok(result) => {
-                    self.pending_inference = None;
+                    self.pending_inference = false;
                     let output = result?;
                     if let Some(line) = self.process_asr_output(output, sample_rate_hz)? {
                         emitted_lines.push(line);
@@ -327,7 +343,7 @@ impl AppController {
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.pending_inference = None;
+                    self.pending_inference = false;
                     return Err(CoreError::Asr(AsrError::InferenceFailed(
                         "asr worker disconnected".to_owned(),
                     )));
@@ -335,7 +351,7 @@ impl AppController {
             }
         }
 
-        if self.pending_inference.is_some() {
+        if self.pending_inference {
             return Ok(emitted_lines);
         }
 
@@ -353,9 +369,14 @@ impl AppController {
         let window_samples =
             (sample_rate_hz as usize * MAX_AUDIO_WINDOW_SECS).min(self.live_audio_samples.len());
         let window_start = self.live_audio_samples.len() - window_samples;
-        let inference_window = &self.live_audio_samples[window_start..];
+        let inference_window: Vec<f32> = self
+            .live_audio_samples
+            .iter()
+            .skip(window_start)
+            .copied()
+            .collect();
 
-        let rms = rms(inference_window);
+        let rms = rms(&inference_window);
         if rms < SILENCE_RMS_THRESHOLD {
             trim_to_tail(
                 &mut self.live_audio_samples,
@@ -368,15 +389,20 @@ impl AppController {
             source_language: self.source_language,
             target_language: self.target_language,
             sample_rate_hz,
-            audio_samples: inference_window.to_vec(),
+            audio_samples: inference_window,
         };
 
-        let asr = Arc::clone(&self.asr);
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(asr.infer(&request));
-        });
-        self.pending_inference = Some(PendingInference { receiver: rx });
+        let request_tx = self.inference_request_tx.as_ref().ok_or_else(|| {
+            CoreError::Asr(AsrError::InferenceFailed(
+                "asr worker is not initialized".to_owned(),
+            ))
+        })?;
+        request_tx.send(request).map_err(|_| {
+            CoreError::Asr(AsrError::InferenceFailed(
+                "failed to send request to asr worker".to_owned(),
+            ))
+        })?;
+        self.pending_inference = true;
         self.last_infer_at = Some(Instant::now());
 
         Ok(emitted_lines)
@@ -392,7 +418,49 @@ impl AppController {
         self.listening_started_at = None;
         self.last_infer_at = None;
         self.last_emitted_normalized = None;
-        self.pending_inference = None;
+        self.pending_inference = false;
+        self.stop_inference_worker();
+    }
+
+    fn start_inference_worker(&mut self) {
+        self.stop_inference_worker();
+
+        let (request_tx, request_rx) = mpsc::channel::<AsrRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<Result<AsrOutput, AsrError>>();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let asr = Arc::clone(&self.asr);
+        let worker = std::thread::spawn(move || loop {
+            match stop_rx.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+
+            match request_rx.recv_timeout(INFERENCE_WORKER_POLL_INTERVAL) {
+                Ok(request) => {
+                    if result_tx.send(asr.infer(&request)).is_err() {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        });
+
+        self.inference_request_tx = Some(request_tx);
+        self.inference_result_rx = Some(result_rx);
+        self.inference_stop_tx = Some(stop_tx);
+        self.inference_worker = Some(worker);
+    }
+
+    fn stop_inference_worker(&mut self) {
+        if let Some(stop_tx) = self.inference_stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        self.inference_request_tx = None;
+        self.inference_result_rx = None;
+        if let Some(worker) = self.inference_worker.take() {
+            drop(worker);
+        }
     }
 
     fn process_asr_output(
@@ -428,9 +496,10 @@ impl AppController {
             .listening_started_at
             .map(|started| started.elapsed().as_millis() as u64)
             .unwrap_or(0);
+        let source_icon = self.resolve_live_source_icon()?;
 
         self.transcript
-            .add_line(timestamp_ms, SourceIcon::Mic, rendered.clone());
+            .add_line(timestamp_ms, source_icon, rendered.clone());
         trim_to_tail(
             &mut self.live_audio_samples,
             sample_rate_hz as usize * RETAIN_TAIL_SECS,
@@ -438,7 +507,7 @@ impl AppController {
 
         Ok(Some(LiveTranscriptLine {
             timestamp_ms,
-            source: SourceIcon::Mic,
+            source: source_icon,
             text: rendered,
         }))
     }
@@ -451,8 +520,11 @@ impl AppController {
         if matches!(self.source_language, Language::Japanese)
             && matches!(self.target_language, Language::English)
         {
-            // Whisper already performs direct JA->EN translation in this path.
-            return Ok(transcript.to_owned());
+            // Prefer native Whisper translation output when already English-like.
+            // Some JP-specialized ASR models emit Japanese text even for JA->EN mode.
+            if !contains_japanese_script(transcript) {
+                return Ok(transcript.to_owned());
+            }
         }
 
         let source = to_translation_language(self.source_language);
@@ -460,6 +532,16 @@ impl AppController {
         self.translator
             .translate(transcript, source, target)
             .map_err(Into::into)
+    }
+
+    fn resolve_live_source_icon(&self) -> Result<SourceIcon, CoreError> {
+        let mic_enabled = self.capture.source_enabled(CaptureSource::Mic)?;
+        let system_enabled = self.capture.source_enabled(CaptureSource::SystemAudio)?;
+        Ok(match (mic_enabled, system_enabled) {
+            (true, true) => SourceIcon::Mixed,
+            (false, true) => SourceIcon::SystemAudio,
+            _ => SourceIcon::Mic,
+        })
     }
 }
 
@@ -474,15 +556,14 @@ fn rms(samples: &[f32]) -> f32 {
     (sum / samples.len() as f32).sqrt()
 }
 
-fn trim_to_tail(samples: &mut Vec<f32>, keep: usize) {
+fn trim_to_tail(samples: &mut VecDeque<f32>, keep: usize) {
     if keep == 0 {
         samples.clear();
         return;
     }
 
-    if samples.len() > keep {
-        let remove = samples.len() - keep;
-        samples.drain(..remove);
+    while samples.len() > keep {
+        let _ = samples.pop_front();
     }
 }
 
@@ -500,6 +581,19 @@ fn normalize_for_dedupe(text: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn contains_japanese_script(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x3040..=0x309F // Hiragana
+                | 0x30A0..=0x30FF // Katakana
+                | 0x31F0..=0x31FF // Katakana Phonetic Extensions
+                | 0x4E00..=0x9FFF // CJK Unified Ideographs
+                | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        )
+    })
 }
 
 fn validate_language_config(

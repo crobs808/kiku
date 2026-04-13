@@ -158,54 +158,6 @@ body {
   gap: 6px;
 }
 
-.status-toggle {
-  position: relative;
-  display: inline-grid;
-  grid-template-columns: 1fr 1fr;
-  align-items: center;
-  min-width: 128px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(7, 20, 29, 0.92);
-  padding: 2px;
-  overflow: hidden;
-}
-
-.status-toggle::before {
-  content: "";
-  position: absolute;
-  top: 2px;
-  bottom: 2px;
-  width: calc(50% - 2px);
-  border-radius: 999px;
-  background: linear-gradient(145deg, rgba(119, 205, 255, 0.38), rgba(90, 171, 216, 0.24));
-  border: 1px solid rgba(166, 226, 255, 0.38);
-  transition: transform 180ms ease;
-}
-
-.status-toggle.ready-active::before {
-  transform: translateX(0);
-}
-
-.status-toggle.standby-active::before {
-  transform: translateX(100%);
-}
-
-.status-toggle-item {
-  position: relative;
-  z-index: 1;
-  text-align: center;
-  white-space: nowrap;
-  padding: 0.13rem 0.54rem;
-  font-size: 0.66rem;
-  color: #8faec2;
-  font-weight: 620;
-}
-
-.status-toggle-item.active {
-  color: #e2f3ff;
-}
-
 .lang-inline {
   display: flex;
   align-items: center;
@@ -433,7 +385,7 @@ body {
 .visualizer {
   display: flex;
   align-items: flex-end;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 12px;
   border-radius: 10px;
   border: 1px solid var(--line);
@@ -556,151 +508,6 @@ body {
   filter: none;
 }
 
-.companion-widget {
-  width: 214px;
-  max-width: 38vw;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
-  user-select: none;
-}
-
-.companion-scene {
-  width: 100%;
-  height: 124px;
-  border-radius: 6px;
-  border: 1px solid rgba(169, 204, 226, 0.28);
-  background: #0a1d29;
-  overflow: hidden;
-}
-
-.companion-scene svg {
-  width: 100%;
-  height: 100%;
-  image-rendering: pixelated;
-  image-rendering: crisp-edges;
-}
-
-.companion-label {
-  margin: 0;
-  font-size: 0.58rem;
-  color: #8caec4;
-  font-family: "IBM Plex Mono", "SF Mono", "Consolas", monospace;
-  text-transform: lowercase;
-  letter-spacing: 0.02em;
-}
-
-.pixel-shiba {
-  transform-box: fill-box;
-  transform-origin: center bottom;
-  animation: pixel-bob 1.2s steps(2, end) infinite;
-}
-
-.mode-sleeping .pixel-shiba {
-  animation: pixel-sleep 2s steps(2, end) infinite;
-}
-
-.mode-watch-transcript .pixel-shiba,
-.mode-system-monitor .pixel-shiba {
-  animation: pixel-watch 1.4s steps(2, end) infinite;
-}
-
-.mode-fetch .pixel-shiba {
-  animation: pixel-fetch 1.8s steps(3, end) infinite;
-}
-
-.frame-1 .pixel-shiba {
-  filter: brightness(1.03);
-}
-
-.frame-2 .pixel-shiba {
-  filter: brightness(0.98);
-}
-
-.wag-tail .pixel-tail {
-  transform-box: fill-box;
-  transform-origin: left center;
-  animation: pixel-tail-wag 0.42s steps(2, end) infinite;
-}
-
-.perk-ears .pixel-ears {
-  transform: translateY(-1px);
-}
-
-.pixel-toy {
-  animation: pixel-toy-hop 0.8s steps(2, end) infinite;
-}
-
-.mode-sleeping .pixel-toy {
-  opacity: 0.45;
-  animation: none;
-}
-
-@keyframes pixel-bob {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(1px);
-  }
-}
-
-@keyframes pixel-sleep {
-  0%,
-  100% {
-    transform: translateY(1px);
-  }
-  50% {
-    transform: translateY(2px);
-  }
-}
-
-@keyframes pixel-watch {
-  0%,
-  100% {
-    transform: translate(0, 0);
-  }
-  50% {
-    transform: translate(-1px, 0);
-  }
-}
-
-@keyframes pixel-fetch {
-  0%,
-  100% {
-    transform: translate(0, 0);
-  }
-  30% {
-    transform: translate(-8px, -1px);
-  }
-  62% {
-    transform: translate(-4px, 0);
-  }
-}
-
-@keyframes pixel-tail-wag {
-  0%,
-  100% {
-    transform: rotate(0deg);
-  }
-  50% {
-    transform: rotate(-8deg);
-  }
-}
-
-@keyframes pixel-toy-hop {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(-1px);
-  }
-}
-
 .saved-output {
   border-radius: 10px;
   border: 1px solid var(--line);
@@ -711,6 +518,10 @@ body {
 .decision-buttons {
   display: flex;
   gap: 8px;
+}
+
+.stop-confirm-modal .decision-buttons {
+  flex-wrap: wrap;
 }
 
 .decision-modal-backdrop {
@@ -973,16 +784,5 @@ body {
   .visualizer {
     align-items: stretch;
     flex-direction: column;
-  }
-
-  .companion-widget {
-    width: 100%;
-    max-width: none;
-    align-items: flex-start;
-  }
-
-  .companion-scene {
-    width: 100%;
-    height: 118px;
   }
 }

@@ -116,6 +116,20 @@ const fallback: {
       recommended: true
     },
     {
+      id: "large-v3-turbo",
+      name: "Whisper Large v3 Turbo",
+      family: "Whisper.cpp",
+      size: "1.6 GB",
+      approx_wer: "~5.6%",
+      latency: "Fast high-quality preset",
+      language_focus: "Multilingual with better speed",
+      best_for: "Lower-latency meetings while keeping high translation quality",
+      notes: "Recommended when Large v3 quality is needed with faster response.",
+      availability: "available_now",
+      downloadable: true,
+      recommended: false
+    },
+    {
       id: "medium",
       name: "Whisper Medium",
       family: "Whisper.cpp",
@@ -125,6 +139,20 @@ const fallback: {
       language_focus: "Japanese + English",
       best_for: "Balanced option for long meetings on most Macs",
       notes: "Good fallback when Large v3 feels too heavy.",
+      availability: "available_now",
+      downloadable: true,
+      recommended: false
+    },
+    {
+      id: "distil-large-v3",
+      name: "Distil-Whisper Large v3",
+      family: "Distil-Whisper (GGML)",
+      size: "1.5 GB",
+      approx_wer: "~5.8% (English benchmark)",
+      latency: "Very fast large-model class",
+      language_focus: "English-heavy meetings / mixed content",
+      best_for: "Fast long meetings where low latency is critical",
+      notes: "Runs through Whisper-compatible runtime with strong speed gains.",
       availability: "available_now",
       downloadable: true,
       recommended: false
@@ -159,16 +187,16 @@ const fallback: {
     },
     {
       id: "kotoba-whisper-v2",
-      name: "Kotoba-Whisper v2 (Candidate)",
+      name: "Kotoba-Whisper v2.0",
       family: "Kotoba / Whisper family",
-      size: "~3-4 GB (varies by package)",
-      approx_wer: "N/A in current build",
-      latency: "Expected medium-high",
+      size: "3.1 GB",
+      approx_wer: "~5.0% (JP-focused estimate)",
+      latency: "Medium-high",
       language_focus: "Japanese-focused ASR",
-      best_for: "Future Japanese-heavy transcription quality",
-      notes: "Planned integration target for stronger Japanese specialization.",
-      availability: "planned",
-      downloadable: false,
+      best_for: "Japanese-heavy meetings where Whisper variants miss terms",
+      notes: "GGML Whisper-compatible Japanese-specialized model.",
+      availability: "available_now",
+      downloadable: true,
       recommended: false
     },
     {

@@ -27,7 +27,6 @@ import {
   startListening,
   stopListening
 } from "./backend";
-import { CompanionShiba } from "./CompanionShiba";
 
 const defaultSnapshot: SessionSnapshot = {
   state: "ready",
@@ -68,6 +67,7 @@ export function App() {
   const [modelActionPending, setModelActionPending] = useState<false | "switch" | "delete">(false);
   const [modelManagerOpen, setModelManagerOpen] = useState(false);
   const [modelPromptDismissed, setModelPromptDismissed] = useState(false);
+  const [stopConfirmOpen, setStopConfirmOpen] = useState(false);
   const [savedTranscript, setSavedTranscript] = useState<string>("");
   const [micEnabled, setMicEnabledLocal] = useState(true);
   const [systemEnabled, setSystemEnabledLocal] = useState(false);
@@ -79,6 +79,7 @@ export function App() {
 
   const isListening = snapshot.state === "listening";
   const isAwaitingDecision = snapshot.state === "prompting_save_discard";
+  const isStopConfirmVisible = stopConfirmOpen && isListening;
   const isModelMissing = snapshot.state === "model_missing";
   const isDownloadingModel = snapshot.state === "downloading_model" || modelDownload.in_progress;
   const isModelPromptVisible =
@@ -97,15 +98,17 @@ export function App() {
     snapshot.state === "prompting_save_discard" ||
     snapshot.state === "saving_transcript";
   const noModelInstalled = !hasInstalledModel;
-  const readyStatusActive = snapshot.state === "ready" || snapshot.state === "listening";
-  const controlsLocked = isAwaitingDecision || sessionActionPending !== null;
-  const startDisabled =
+  const sessionStatus = getSessionStatus(snapshot.state);
+  const controlsLocked = isAwaitingDecision || isStopConfirmVisible || sessionActionPending !== null;
+  const startActionDisabled =
     controlsLocked ||
     isStopping ||
     isModelMissing ||
     isDownloadingModel ||
     !hasEnabledSource ||
     !hasInstalledModel;
+  const stopActionDisabled = controlsLocked || isStopping;
+  const listenButtonDisabled = isListening ? stopActionDisabled : startActionDisabled;
   const modelProgressPercent = Math.round(Math.max(0, Math.min(1, modelDownload.progress)) * 100);
   const activeModelId = useMemo(
     () => modelInventory.find((model) => model.active)?.id ?? null,
@@ -118,13 +121,20 @@ export function App() {
   const selectedCatalogModel =
     modelCatalog.find((model) => model.id === selectedModelId) ?? null;
   const selectedModelDownloadable = selectedCatalogModel?.downloadable ?? false;
-  const isModelControlsDisabled = isListening || isDownloadingModel || modelActionPending !== false;
+  const isModelSwitchDisabled = isDownloadingModel || modelActionPending !== false;
+  const isModelDeleteDisabled = isListening || isDownloadingModel || modelActionPending !== false;
 
   useEffect(() => {
     if (!isModelMissing && !isDownloadingModel) {
       setModelPromptDismissed(false);
     }
   }, [isModelMissing, isDownloadingModel]);
+
+  useEffect(() => {
+    if (!isListening) {
+      setStopConfirmOpen(false);
+    }
+  }, [isListening]);
 
   useEffect(() => {
     const suppressContextMenu = (event: MouseEvent) => {
@@ -163,7 +173,7 @@ export function App() {
     void refreshModelDownloadProgress();
     void refreshLanguageConfig();
     void refreshModelCatalog();
-    void refreshModelInventory();
+    void refreshModelInventory(true);
   }, []);
 
   useEffect(() => {
@@ -171,12 +181,19 @@ export function App() {
       return undefined;
     }
 
+    let inFlight = false;
     const intervalId = window.setInterval(() => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
       void Promise.all([
         refreshSnapshot(),
         refreshModelDownloadProgress(),
         refreshModelInventory()
-      ]);
+      ]).finally(() => {
+        inFlight = false;
+      });
     }, 260);
 
     return () => {
@@ -190,7 +207,12 @@ export function App() {
       return undefined;
     }
 
+    let inFlight = false;
     const intervalId = window.setInterval(() => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
       void Promise.all([getAudioLevel(), pollLiveTranscriptLines()])
         .then(([level, lines]) => {
           const normalizedLevel = Math.max(0, Math.min(1, level));
@@ -199,6 +221,9 @@ export function App() {
         })
         .catch((requestError) => {
           setError(String(requestError));
+        })
+        .finally(() => {
+          inFlight = false;
         });
     }, 180);
 
@@ -212,8 +237,15 @@ export function App() {
       return undefined;
     }
 
+    let inFlight = false;
     const intervalId = window.setInterval(() => {
-      void refreshSnapshot();
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
+      void refreshSnapshot().finally(() => {
+        inFlight = false;
+      });
     }, 200);
 
     return () => {
@@ -275,13 +307,15 @@ export function App() {
     }
   }
 
-  async function refreshModelInventory(): Promise<void> {
+  async function refreshModelInventory(syncSelectionToActive = false): Promise<void> {
     try {
       const inventory = await getModelInventory();
       setModelInventory(inventory);
-      const active = inventory.find((model) => model.active)?.id;
-      if (active) {
-        setSelectedModelId(active);
+      if (syncSelectionToActive) {
+        const active = inventory.find((model) => model.active)?.id;
+        if (active) {
+          setSelectedModelId(active);
+        }
       }
       setError(null);
     } catch (requestError) {
@@ -311,7 +345,19 @@ export function App() {
   }
 
   async function onStop(): Promise<void> {
-    if (sessionActionPending !== null) {
+    if (sessionActionPending !== null || !isListening) {
+      return;
+    }
+
+    setStopConfirmOpen(true);
+  }
+
+  function onKeepListening(): void {
+    setStopConfirmOpen(false);
+  }
+
+  async function onConfirmStop(nextStep: "discard" | "save"): Promise<void> {
+    if (sessionActionPending !== null || !isListening) {
       return;
     }
 
@@ -319,6 +365,19 @@ export function App() {
     try {
       setSnapshot(await stopListening());
       setPendingLineCount(0);
+
+      if (nextStep === "discard") {
+        setSnapshot(await discardTranscript());
+        setSavedTranscript("");
+        setTranscriptLines([]);
+        setPendingLineCount(0);
+      } else {
+        const transcript = await saveTranscript();
+        setSavedTranscript(transcript);
+        await refreshSnapshot();
+      }
+
+      setStopConfirmOpen(false);
       setError(null);
     } catch (requestError) {
       setError(String(requestError));
@@ -394,7 +453,7 @@ export function App() {
   }
 
   async function onActivateModel(modelId: string): Promise<void> {
-    if (modelId.length === 0 || modelActionPending !== false || isListening || isDownloadingModel) {
+    if (modelId.length === 0 || modelActionPending !== false || isDownloadingModel) {
       return;
     }
 
@@ -419,12 +478,17 @@ export function App() {
 
     setModelActionPending("delete");
     try {
-      setModelInventory(await deleteModel(modelId));
+      const inventory = await deleteModel(modelId);
+      setModelInventory(inventory);
+      const active = inventory.find((model) => model.active)?.id;
+      if (active) {
+        setSelectedModelId(active);
+      }
       await refreshSnapshot();
       setError(null);
     } catch (requestError) {
       setError(String(requestError));
-      await Promise.all([refreshSnapshot(), refreshModelInventory()]);
+      await Promise.all([refreshSnapshot(), refreshModelInventory(true)]);
     } finally {
       setModelActionPending(false);
     }
@@ -521,13 +585,14 @@ export function App() {
   }
 
   const micLitSegments = Math.round(audioLevel * METER_SEGMENTS);
+  const systemLitSegments = Math.round(audioLevel * METER_SEGMENTS);
   const micMeterSegments = useMemo(
     () => createMeterSegments(micLitSegments, micEnabled, isListening),
     [isListening, micEnabled, micLitSegments]
   );
   const systemMeterSegments = useMemo(
-    () => createMeterSegments(0, systemEnabled, isListening),
-    [isListening, systemEnabled]
+    () => createMeterSegments(systemLitSegments, systemEnabled, isListening),
+    [isListening, systemEnabled, systemLitSegments]
   );
   const targetLanguageOptions = useMemo(
     () => ["english", "japanese"] as AsrLanguage[],
@@ -561,7 +626,7 @@ export function App() {
   return (
     <>
       <main
-        className={`layout ${isAwaitingDecision || isModelPromptVisible ? "modal-active" : ""}`}
+        className={`layout ${isAwaitingDecision || isStopConfirmVisible || isModelPromptVisible ? "modal-active" : ""}`}
       >
         <header className="topbar">
           <div className="topbar-left">
@@ -575,19 +640,11 @@ export function App() {
               </div>
             </div>
             <div className="status-inline">
-              <div
-                className={`status-toggle ${readyStatusActive ? "ready-active" : "standby-active"}`}
-                aria-label="readiness status"
-              >
-                <span className={`status-toggle-item ${readyStatusActive ? "active" : ""}`}>Ready</span>
-                <span className={`status-toggle-item ${!readyStatusActive ? "active" : ""}`}>
-                  Standby
-                </span>
-              </div>
-              <span
-                className={`status-chip ${snapshot.offline_mode_active ? "good" : "warn"}`}
-              >
-                {snapshot.offline_mode_active ? "Offline Mode" : "Standby"}
+              <span className={`status-chip ${sessionStatus.tone}`}>
+                {sessionStatus.label}
+              </span>
+              <span className={`status-chip ${snapshot.offline_mode_active ? "good" : "muted"}`}>
+                {snapshot.offline_mode_active ? "Privacy: Offline Active" : "Privacy: Offline Idle"}
               </span>
             </div>
             <div className="lang-inline">
@@ -637,7 +694,7 @@ export function App() {
               <select
                 value={activeModelId ?? ""}
                 onChange={(event) => void onActivateModel(event.currentTarget.value)}
-                disabled={isModelControlsDisabled || installedModels.length === 0}
+                disabled={isModelSwitchDisabled || installedModels.length === 0}
               >
                 {installedModels.length > 0 ? (
                   installedModels.map((model) => (
@@ -660,19 +717,21 @@ export function App() {
             <button
               className="button primary"
               onClick={isListening ? onStop : onStart}
-              disabled={startDisabled}
+              disabled={listenButtonDisabled}
             >
-              {isDownloadingModel
-                ? "Downloading Model..."
-                : isModelMissing
-                ? "Model Required"
-                : sessionActionPending === "start"
-                ? "Starting..."
-                : sessionActionPending === "stop" || isStopping
+              {isListening
+                ? sessionActionPending === "stop" || isStopping
                   ? "Stopping..."
-                  : isListening
-                    ? "Stop Listening"
-                    : "Start Listening"}
+                  : isStopConfirmVisible
+                    ? "Confirm Stop..."
+                    : "Stop Listening"
+                : isModelMissing
+                  ? "Model Required"
+                  : isDownloadingModel
+                    ? "Downloading Model..."
+                    : sessionActionPending === "start"
+                      ? "Starting..."
+                      : "Start Listening"}
             </button>
             <button
               className={`button toggle ${micEnabled ? "active" : ""}`}
@@ -693,9 +752,18 @@ export function App() {
 
         <section className="prototype-note" aria-label="prototype note">
           {isDownloadingModel ? (
-            <p>Model download in progress. Kiku will enable listening automatically when setup completes.</p>
+            <p>
+              {isListening
+                ? "Model download in progress in the background. Live captions continue; switch models when download completes."
+                : "Model download in progress. Listening will be available once setup completes."}
+            </p>
           ) : isModelMissing ? (
             <p>Model setup is required before listening can start. Use the in-app download prompt.</p>
+          ) : systemEnabled && !micEnabled ? (
+            <p>
+              System-source mode is active. Kiku currently reads from macOS default input path for
+              this mode; dedicated native loopback capture is the next implementation step.
+            </p>
           ) : (
             <p>
               {currentModelName} is active. Live {formatLanguageLabel(languageConfig.source_language)} to{" "}
@@ -780,13 +848,6 @@ export function App() {
               <p className="widget-subtitle">{isListening ? "Live input level" : "Waiting for input"}</p>
             </div>
           </div>
-          <CompanionShiba
-            isListening={isListening}
-            audioLevel={audioLevel}
-            micEnabled={micEnabled}
-            systemEnabled={systemEnabled}
-            transcriptLineCount={transcriptLines.length}
-          />
         </section>
 
         {savedTranscript ? (
@@ -800,6 +861,42 @@ export function App() {
           <p className="error">{error ?? snapshot.last_error}</p>
         ) : null}
       </main>
+
+      {isStopConfirmVisible ? (
+        <section className="decision-modal-backdrop" role="presentation">
+          <div
+            className="decision-modal stop-confirm-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="session-stop-confirm-title"
+          >
+            <h2 id="session-stop-confirm-title">Stop Session?</h2>
+            <p>
+              Choose what to do with this session now. If this was accidental, keep listening and
+              continue live captions.
+            </p>
+            <div className="decision-buttons">
+              <button className="button secondary" onClick={onKeepListening}>
+                Oops! Keep Listening
+              </button>
+              <button
+                className="button secondary danger"
+                onClick={() => void onConfirmStop("discard")}
+                disabled={sessionActionPending === "stop"}
+              >
+                Stop + Discard
+              </button>
+              <button
+                className="button primary"
+                onClick={() => void onConfirmStop("save")}
+                disabled={sessionActionPending === "stop"}
+              >
+                Stop + Save
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       {isAwaitingDecision ? (
         <section className="decision-modal-backdrop" role="presentation">
@@ -915,7 +1012,7 @@ export function App() {
                               event.stopPropagation();
                               void onActivateModel(model.id);
                             }}
-                            disabled={isModelControlsDisabled}
+                            disabled={isModelSwitchDisabled}
                           >
                             Use This Model
                           </button>
@@ -926,7 +1023,7 @@ export function App() {
                             event.stopPropagation();
                             void onDeleteModel(model.id);
                           }}
-                          disabled={isModelControlsDisabled}
+                          disabled={isModelDeleteDisabled}
                         >
                           Delete
                         </button>
@@ -1006,6 +1103,32 @@ function formatSource(source: LiveTranscriptLine["source"]): string {
 
 function formatLanguageLabel(language: AsrLanguage): string {
   return language === "japanese" ? "Japanese" : "English";
+}
+
+function getSessionStatus(state: SessionSnapshot["state"]): {
+  label: string;
+  tone: "good" | "warn" | "neutral" | "muted";
+} {
+  switch (state) {
+    case "listening":
+      return { label: "Session: Listening", tone: "good" };
+    case "ready":
+      return { label: "Session: Ready", tone: "neutral" };
+    case "downloading_model":
+      return { label: "Session: Installing Model", tone: "neutral" };
+    case "model_missing":
+      return { label: "Session: Model Required", tone: "warn" };
+    case "stopping":
+      return { label: "Session: Stopping", tone: "warn" };
+    case "prompting_save_discard":
+      return { label: "Session: Awaiting Save", tone: "warn" };
+    case "saving_transcript":
+      return { label: "Session: Saving", tone: "neutral" };
+    case "error":
+      return { label: "Session: Error", tone: "warn" };
+    default:
+      return { label: "Session: Idle", tone: "muted" };
+  }
 }
 
 function createMeterSegments(litSegments: number, enabled: boolean, listening: boolean) {

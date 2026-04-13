@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -155,7 +156,7 @@ impl Default for CpalControlState {
 pub struct CpalCaptureBackend {
     level_bits: Arc<AtomicU32>,
     sample_rate_hz: Arc<AtomicU32>,
-    mic_samples: Arc<Mutex<Vec<f32>>>,
+    mic_samples: Arc<Mutex<VecDeque<f32>>>,
     inner: Mutex<CpalControlState>,
 }
 
@@ -164,7 +165,7 @@ impl Default for CpalCaptureBackend {
         Self {
             level_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             sample_rate_hz: Arc::new(AtomicU32::new(DEFAULT_SAMPLE_RATE_HZ)),
-            mic_samples: Arc::new(Mutex::new(Vec::new())),
+            mic_samples: Arc::new(Mutex::new(VecDeque::new())),
             inner: Mutex::new(CpalControlState::default()),
         }
     }
@@ -197,12 +198,6 @@ impl CaptureBackend for CpalCaptureBackend {
             return Err(CaptureError::AlreadyRunning);
         }
         if !state.mic_enabled && !state.system_audio_enabled {
-            return Err(CaptureError::NoActiveSource);
-        }
-        if state.system_audio_enabled && !state.mic_enabled {
-            return Err(CaptureError::SystemAudioNotImplemented);
-        }
-        if !state.mic_enabled {
             return Err(CaptureError::NoActiveSource);
         }
 
@@ -282,7 +277,7 @@ impl CaptureBackend for CpalCaptureBackend {
 
         let drain_count = max_samples.min(samples.len());
         if drain_count == samples.len() {
-            return Ok(std::mem::take(&mut *samples));
+            return Ok(samples.drain(..).collect());
         }
 
         Ok(samples.drain(..drain_count).collect())
@@ -292,7 +287,7 @@ impl CaptureBackend for CpalCaptureBackend {
 fn run_mic_capture_worker(
     level_bits: Arc<AtomicU32>,
     sample_rate_hz: Arc<AtomicU32>,
-    mic_samples: Arc<Mutex<Vec<f32>>>,
+    mic_samples: Arc<Mutex<VecDeque<f32>>>,
     stop_rx: mpsc::Receiver<()>,
     started_tx: mpsc::Sender<CaptureResult<()>>,
 ) {
@@ -324,7 +319,7 @@ fn run_mic_capture_worker(
 fn build_mic_stream(
     level_bits: Arc<AtomicU32>,
     sample_rate_hz: Arc<AtomicU32>,
-    mic_samples: Arc<Mutex<Vec<f32>>>,
+    mic_samples: Arc<Mutex<VecDeque<f32>>>,
 ) -> CaptureResult<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
@@ -411,7 +406,7 @@ fn update_level_and_store_from_f32(
     channels: u16,
     sample_rate_hz: u32,
     level_bits: &AtomicU32,
-    mic_samples: &Mutex<Vec<f32>>,
+    mic_samples: &Mutex<VecDeque<f32>>,
 ) {
     let mono = interleaved_to_mono(samples.iter().copied(), channels);
     let rms = rms_normalized(mono.iter().copied());
@@ -424,7 +419,7 @@ fn update_level_and_store_from_i16(
     channels: u16,
     sample_rate_hz: u32,
     level_bits: &AtomicU32,
-    mic_samples: &Mutex<Vec<f32>>,
+    mic_samples: &Mutex<VecDeque<f32>>,
 ) {
     let normalized = interleaved_to_mono(
         samples
@@ -443,7 +438,7 @@ fn update_level_and_store_from_u16(
     channels: u16,
     sample_rate_hz: u32,
     level_bits: &AtomicU32,
-    mic_samples: &Mutex<Vec<f32>>,
+    mic_samples: &Mutex<VecDeque<f32>>,
 ) {
     let normalized = interleaved_to_mono(
         samples
@@ -477,7 +472,11 @@ fn interleaved_to_mono(samples: impl Iterator<Item = f32>, channels: u16) -> Vec
     mono
 }
 
-fn push_mic_samples(new_samples: Vec<f32>, sample_rate_hz: u32, mic_samples: &Mutex<Vec<f32>>) {
+fn push_mic_samples(
+    new_samples: Vec<f32>,
+    sample_rate_hz: u32,
+    mic_samples: &Mutex<VecDeque<f32>>,
+) {
     if new_samples.is_empty() {
         return;
     }
@@ -489,9 +488,8 @@ fn push_mic_samples(new_samples: Vec<f32>, sample_rate_hz: u32, mic_samples: &Mu
 
     buffer.extend(new_samples);
     let max_samples = sample_rate_hz as usize * MIC_RING_BUFFER_SECS;
-    if buffer.len() > max_samples {
-        let overflow = buffer.len() - max_samples;
-        buffer.drain(..overflow);
+    while buffer.len() > max_samples {
+        let _ = buffer.pop_front();
     }
 }
 

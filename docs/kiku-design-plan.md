@@ -60,6 +60,7 @@ These are intentionally out of scope for the first shipping version:
 - Speaker diarization with reliable person identity tracking
 - Full transcript editor inside the app
 - Full typed "Speak Mode" (text translate + TTS playback) implementation
+- Full interactive "Learning Mode" implementation (guided pronunciation/scoring)
 - Multi-language packs beyond English and Japanese
 - iOS support in v1
 - Intel Mac support in v1
@@ -135,7 +136,7 @@ These are intentionally out of scope for the first shipping version:
 - Movable and resizable
 - Optional transparency
 - Live controls in the top bar
-- Mode tabs in top bar: `Listen` and `Speak` (Speak is planned, not in current MVP)
+- Mode tabs in top bar: `Listen`, `Speak`, and `Learning` (`Speak`/`Learning` are planned, not in current MVP)
 - Secondary settings menu for less frequently used options
 
 ### Transcript behavior
@@ -333,6 +334,15 @@ Swift plugin(s) for ScreenCaptureKit and permission-sensitive integrations.
 5. User clicks `Play`.
 6. App speaks the translated text using local/offline TTS voice in the target language/accent.
 7. User can revise source text and replay as needed.
+
+### Flow F: Planned Learning mode (post-MVP, discovery required)
+1. User switches to the `Learning` tab.
+2. User selects a language direction (for example English -> Japanese practice).
+3. User types a word or sentence they want to practice.
+4. App shows the target-language text and optionally provides `Play` audio for reference pronunciation.
+5. User clicks a mic icon and speaks the phrase.
+6. App compares spoken output with target phrase and shows a match/score result (for example similarity percentage).
+7. Future enhancement path: add pronunciation/accent quality scoring and targeted feedback hints.
 
 ---
 
@@ -536,6 +546,7 @@ Kiku should behave like a floating utility window that sits beside or above a me
 ### Main visible regions
 0. **Mode tabs (planned)**
    - `Listen` tab for live audio captioning
+   - `Learning` tab for guided speaking practice and scoring (planned, post-MVP)
    - `Speak` tab for typed translation + TTS playback (planned, post-MVP)
 
 1. **Top control bar**
@@ -581,6 +592,15 @@ Speak mode is approved as a planned feature direction, but it must not be implem
 - latency, quality, and privacy acceptance criteria
 - export/history behavior (if any)
 - platform parity expectations (macOS first vs Android timing)
+
+### Planned Learning mode note (discussion required before build)
+Learning mode is approved as a planned feature direction, but it must not be implemented until a focused discovery pass defines:
+- exact learning UX (single phrase drill vs session playlist/lesson flow)
+- scoring model (string similarity baseline vs pronunciation/phoneme analysis)
+- feedback depth (simple pass/fail vs detailed coaching hints)
+- mic capture and privacy behavior for practice recordings (if any retention is allowed)
+- reference-audio strategy (local TTS voices and asset packaging)
+- progress tracking/history expectations and local data retention policy
 
 ---
 
@@ -814,6 +834,13 @@ Add a separate reviewer-oriented document later covering:
 - implement local TTS playback controls
 - finalize UX after discovery decisions
 
+### Phase 7: Learning mode (planned, post-discovery)
+- add `Learning` tab shell and language-direction selector
+- implement phrase prompt + user speech capture loop
+- implement baseline match scoring and feedback UI
+- evaluate optional pronunciation/accent scoring path
+- finalize UX after discovery decisions
+
 ---
 
 ## 24. Suggested Internal Milestones
@@ -941,6 +968,9 @@ These do not block the design plan but will need decisions during implementation
 8. Speak mode translation backend choice and whether it reuses ASR translation stack or separate MT path
 9. Speak mode TTS backend/runtime and local voice asset packaging/update strategy
 10. Speak mode privacy/logging policy for typed input and playback history
+11. Learning mode scoring approach and success criteria (text similarity vs pronunciation model)
+12. Learning mode UX depth (quick drill vs structured lesson progression)
+13. Learning mode persistence/privacy policy for practice data and progress
 
 ---
 
