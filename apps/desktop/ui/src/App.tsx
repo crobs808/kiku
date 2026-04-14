@@ -74,8 +74,12 @@ export function App() {
   const [audioLevel, setAudioLevel] = useState(0);
   const [transcriptLines, setTranscriptLines] = useState<string[]>([]);
   const [pendingLineCount, setPendingLineCount] = useState(0);
+  const [followLive, setFollowLive] = useState(true);
   const captionPanelRef = useRef<HTMLElement | null>(null);
   const isNearBottomRef = useRef(true);
+  const followLiveRef = useRef(true);
+  const manualScrollArmedRef = useRef(false);
+  const suppressScrollEventsRef = useRef(false);
 
   const isListening = snapshot.state === "listening";
   const isAwaitingDecision = snapshot.state === "prompting_save_discard";
@@ -334,6 +338,7 @@ export function App() {
       setSavedTranscript("");
       setTranscriptLines([]);
       setPendingLineCount(0);
+      setFollowLiveState(true);
       window.requestAnimationFrame(() => scrollToLatest());
       setError(null);
     } catch (requestError) {
@@ -377,6 +382,7 @@ export function App() {
         await refreshSnapshot();
       }
 
+      setFollowLiveState(true);
       setStopConfirmOpen(false);
       setError(null);
     } catch (requestError) {
@@ -393,6 +399,7 @@ export function App() {
       setSavedTranscript("");
       setTranscriptLines([]);
       setPendingLineCount(0);
+      setFollowLiveState(true);
       setError(null);
     } catch (requestError) {
       setError(String(requestError));
@@ -549,7 +556,7 @@ export function App() {
       return;
     }
 
-    const shouldAutoScroll = isNearBottomRef.current;
+    const shouldAutoScroll = followLiveRef.current;
     const formatted = lines.map(
       (line) => `[${formatTimestamp(line.timestamp_ms)}] [${formatSource(line.source)}] ${line.text}`
     );
@@ -599,18 +606,32 @@ export function App() {
     []
   );
 
+  function setFollowLiveState(enabled: boolean): void {
+    followLiveRef.current = enabled;
+    setFollowLive(enabled);
+  }
+
   function scrollToLatest(): void {
     const panel = captionPanelRef.current;
     if (!panel) {
       return;
     }
 
+    suppressScrollEventsRef.current = true;
     panel.scrollTop = panel.scrollHeight;
+    window.requestAnimationFrame(() => {
+      suppressScrollEventsRef.current = false;
+    });
     isNearBottomRef.current = true;
+    setFollowLiveState(true);
     setPendingLineCount(0);
   }
 
   function handleCaptionScroll(): void {
+    if (suppressScrollEventsRef.current) {
+      return;
+    }
+
     const panel = captionPanelRef.current;
     if (!panel) {
       return;
@@ -618,10 +639,29 @@ export function App() {
 
     const nearBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 32;
     isNearBottomRef.current = nearBottom;
-    if (nearBottom && pendingLineCount > 0) {
-      setPendingLineCount(0);
+    if (nearBottom) {
+      if (followLiveRef.current && pendingLineCount > 0) {
+        setPendingLineCount(0);
+      }
+      manualScrollArmedRef.current = false;
+      return;
+    }
+
+    if (manualScrollArmedRef.current) {
+      manualScrollArmedRef.current = false;
+      if (followLiveRef.current) {
+        setFollowLiveState(false);
+      }
     }
   }
+
+  function armManualScroll(): void {
+    manualScrollArmedRef.current = true;
+  }
+
+  useEffect(() => {
+    followLiveRef.current = followLive;
+  }, [followLive]);
 
   return (
     <>
@@ -761,8 +801,8 @@ export function App() {
             <p>Model setup is required before listening can start. Use the in-app download prompt.</p>
           ) : systemEnabled && !micEnabled ? (
             <p>
-              System-source mode is active. Kiku currently reads from macOS default input path for
-              this mode; dedicated native loopback capture is the next implementation step.
+              System-source mode is active. Kiku captures from the loopback-capable system output
+              path, so same-device meetings can be transcribed without using the microphone.
             </p>
           ) : (
             <p>
@@ -778,6 +818,9 @@ export function App() {
             aria-label="caption stream"
             ref={captionPanelRef}
             onScroll={handleCaptionScroll}
+            onMouseDown={armManualScroll}
+            onWheel={armManualScroll}
+            onTouchStart={armManualScroll}
           >
             {transcriptLines.length > 0 ? (
               transcriptLines.map((line, idx) => <p key={`${line}-${idx}`}>{line}</p>)
@@ -798,9 +841,11 @@ export function App() {
               <p>No speech model installed. Go to Model Manager to download a model first.</p>
             </div>
           ) : null}
-          {pendingLineCount > 0 ? (
+          {!followLive ? (
             <button className="new-lines-banner" onClick={scrollToLatest}>
-              ↓ New messages ({pendingLineCount})
+              {pendingLineCount > 0
+                ? `Return to live (${pendingLineCount} new)`
+                : "Return to live"}
             </button>
           ) : null}
         </section>
