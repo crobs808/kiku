@@ -47,6 +47,9 @@ export type LanguageConfig = {
   target_language: AsrLanguage;
 };
 
+export type SystemAudioPermissionStatus = "granted" | "denied" | "unsupported";
+export type AppRestartOutcome = "restarting" | "manual_required";
+
 export type ModelOption = {
   id: string;
   name: string;
@@ -356,6 +359,38 @@ export async function setSystemAudioEnabled(enabled: boolean): Promise<SourceSta
   }
 
   return invoke<SourceState>("set_system_audio_enabled", { enabled });
+}
+
+export async function getSystemAudioPermissionStatus(): Promise<SystemAudioPermissionStatus> {
+  if (!inTauriRuntime()) {
+    return "granted";
+  }
+
+  return invoke<SystemAudioPermissionStatus>("get_system_audio_permission_status");
+}
+
+export async function requestSystemAudioPermissionAccess(): Promise<SystemAudioPermissionStatus> {
+  if (!inTauriRuntime()) {
+    return "granted";
+  }
+
+  return invoke<SystemAudioPermissionStatus>("request_system_audio_permission_access");
+}
+
+export async function openSystemAudioPermissionSettings(): Promise<void> {
+  if (!inTauriRuntime()) {
+    return;
+  }
+
+  await invoke("open_system_audio_permission_settings");
+}
+
+export async function restartApp(): Promise<AppRestartOutcome> {
+  if (!inTauriRuntime()) {
+    return "manual_required";
+  }
+
+  return invoke<AppRestartOutcome>("restart_app");
 }
 
 export async function getLanguageConfig(): Promise<LanguageConfig> {

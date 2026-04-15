@@ -556,6 +556,57 @@ body {
   font-size: 0.87rem;
 }
 
+.permission-modal {
+  width: min(560px, 94vw);
+}
+
+.permission-warning {
+  color: #ffd9a4 !important;
+  margin-top: 0.1rem !important;
+}
+
+.permission-flow {
+  display: grid;
+  gap: 0.65rem;
+  margin-bottom: 0.9rem;
+}
+
+.permission-step {
+  border: 1px solid rgba(156, 198, 226, 0.24);
+  border-radius: 9px;
+  background: rgba(14, 31, 44, 0.72);
+  padding: 0.58rem 0.65rem;
+}
+
+.permission-step-title {
+  margin: 0 0 0.2rem;
+  font-size: 0.8rem;
+  font-weight: 660;
+  color: #dff0fc;
+}
+
+.permission-step-note {
+  margin: 0 0 0.45rem !important;
+  font-size: 0.77rem !important;
+  color: #bfd8ea !important;
+}
+
+.permission-step-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.permission-step-hint {
+  margin: 0.45rem 0 0 !important;
+  font-size: 0.72rem !important;
+  color: #a7c0d3 !important;
+}
+
+.permission-footer {
+  justify-content: flex-end;
+}
+
 .model-modal {
   width: min(540px, 94vw);
 }

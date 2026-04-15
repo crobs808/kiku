@@ -1,9 +1,7 @@
 # KikuCapturePlugin (macOS)
 
-This module will host Swift glue for macOS-specific audio capture integrations:
+This module hosts macOS-native capture glue for Kiku.
 
-- microphone capture permission flow
-- system audio capture via ScreenCaptureKit and related APIs
-- source toggles and routing metadata passed into Rust-owned pipeline
-
-Current state: interface-only scaffold.
+- `SystemAudioCaptureHelper.swift` provides ScreenCaptureKit-based system playback capture.
+- The helper streams `f32` PCM samples to Rust over stdout with a binary header.
+- Permission handling is built in (`CGRequestScreenCaptureAccess`) so users are prompted from Kiku.

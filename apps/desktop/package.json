@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "tauri dev",
+    "dev": "cargo clean -p kiku-desktop && tauri dev",
     "build": "tauri build --bundles app,dmg"
   },
   "devDependencies": {

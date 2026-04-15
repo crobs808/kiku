@@ -6,13 +6,17 @@ use kiku_core::{
     SessionSnapshot, SessionState,
 };
 use kiku_models::InMemoryModelManager;
-use kiku_platform::{CaptureSource, CpalCaptureBackend};
+use kiku_platform::{
+    request_system_audio_permission, system_audio_permission_status, CaptureSource,
+    CpalCaptureBackend, SystemAudioPermissionStatus,
+};
 use kiku_privacy::InMemoryPrivacyGuard;
 use kiku_settings::InMemorySettingsStore;
 use kiku_transcript::SourceIcon;
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
@@ -23,6 +27,14 @@ const MODEL_DOWNLOAD_CANCELLED: &str = "model download cancelled";
 enum ModelAvailability {
     AvailableNow,
     Planned,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AppRestartOutcome {
+    #[cfg(not(debug_assertions))]
+    Restarting,
+    ManualRequired,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -365,6 +377,77 @@ fn set_system_audio_enabled(
     with_controller(&state, |controller| {
         controller.set_source_enabled(CaptureSource::SystemAudio, enabled)
     })
+}
+
+#[tauri::command]
+fn get_system_audio_permission_status() -> Result<SystemAudioPermissionStatus, String> {
+    system_audio_permission_status().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn request_system_audio_permission_access() -> Result<SystemAudioPermissionStatus, String> {
+    request_system_audio_permission().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_system_audio_permission_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut last_error: Option<String> = None;
+        let settings_urls = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenRecording",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture",
+        ];
+        for settings_url in settings_urls {
+            match Command::new("open").arg(settings_url).status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(status) => {
+                    last_error = Some(format!(
+                        "open returned status {} for {settings_url}",
+                        status
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(format!("failed to open {settings_url}: {error}"));
+                }
+            }
+        }
+
+        for app_name in ["System Settings", "System Preferences"] {
+            match Command::new("open").arg("-a").arg(app_name).status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(status) => {
+                    last_error = Some(format!("open -a {app_name} returned status {status}"));
+                }
+                Err(error) => {
+                    last_error = Some(format!("failed to open {app_name}: {error}"));
+                }
+            }
+        }
+
+        if let Some(last_error) = last_error {
+            return Err(format!(
+                "failed to open macOS Privacy & Security settings: {last_error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) -> Result<AppRestartOutcome, String> {
+    #[cfg(debug_assertions)]
+    {
+        let _ = app;
+        Ok(AppRestartOutcome::ManualRequired)
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        app.request_restart();
+        Ok(AppRestartOutcome::Restarting)
+    }
 }
 
 #[tauri::command]
@@ -961,6 +1044,10 @@ fn main() {
             get_source_state,
             set_mic_enabled,
             set_system_audio_enabled,
+            get_system_audio_permission_status,
+            request_system_audio_permission_access,
+            open_system_audio_permission_settings,
+            restart_app,
             get_audio_level,
             get_language_config,
             set_language_config,
