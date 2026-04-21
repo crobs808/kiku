@@ -29,6 +29,22 @@ impl TranscriptBuffer {
         });
     }
 
+    pub fn replace_last_line(
+        &mut self,
+        timestamp_ms: u64,
+        source: SourceIcon,
+        text: impl Into<String>,
+    ) -> bool {
+        if let Some(last) = self.lines.last_mut() {
+            last.timestamp_ms = timestamp_ms;
+            last.source = source;
+            last.text = text.into();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn clear(&mut self) {
         self.lines.clear();
     }

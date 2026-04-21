@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AsrLanguage,
+  AsrProvider,
+  IntegrationSettings,
   LanguageConfig,
   LiveTranscriptLine,
   ModelDownloadProgress,
@@ -12,11 +14,13 @@ import {
   deleteModel,
   discardTranscript,
   getAudioLevel,
+  getIntegrationSettings,
   getLanguageConfig,
   getModelCatalog,
   getModelDownloadProgress,
   getModelInventory,
   getSessionSnapshot,
+  getStreamingTranslationEnabled,
   getSystemAudioPermissionStatus,
   getSourceState,
   openSystemAudioPermissionSettings,
@@ -25,13 +29,17 @@ import {
   restartApp,
   saveTranscript,
   setActiveModel,
+  setIntegrationSettings as saveIntegrationSettings,
   setLanguageConfig as setAsrLanguageConfig,
+  setStreamingTranslationEnabled as setStreamingTranslationMode,
   setMicEnabled,
   setSystemAudioEnabled,
   startModelDownloadById,
   startListening,
   stopListening
 } from "./backend";
+import { PhraseTestFlyout } from "./PhraseTestFlyout";
+import kikuLogoMatte from "../../../../assets/kiku-app-logo-matte.png";
 
 const defaultSnapshot: SessionSnapshot = {
   state: "ready",
@@ -55,6 +63,23 @@ const defaultLanguageConfig: LanguageConfig = {
   source_language: "japanese",
   target_language: "english"
 };
+
+const defaultIntegrationSettings: IntegrationSettings = {
+  asr_provider: "local",
+  translation_provider: "local",
+  google_api_key: ""
+};
+
+function normalizeIntegrationSettings(
+  settings: Partial<IntegrationSettings> | null | undefined
+): IntegrationSettings {
+  return {
+    asr_provider: settings?.asr_provider === "google_cloud" ? "google_cloud" : "local",
+    translation_provider:
+      settings?.translation_provider === "google_cloud" ? "google_cloud" : "local",
+    google_api_key: typeof settings?.google_api_key === "string" ? settings.google_api_key : ""
+  };
+}
 
 const METER_SEGMENTS = 44;
 
@@ -84,6 +109,13 @@ export function App() {
   const [micEnabled, setMicEnabledLocal] = useState(true);
   const [systemEnabled, setSystemEnabledLocal] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [streamingTranslationEnabled, setStreamingTranslationEnabledState] = useState(false);
+  const [streamingModePending, setStreamingModePending] = useState(false);
+  const [integrationModalOpen, setIntegrationModalOpen] = useState(false);
+  const [integrationSettingsDraft, setIntegrationSettingsDraft] =
+    useState<IntegrationSettings>(defaultIntegrationSettings);
+  const [integrationSaving, setIntegrationSaving] = useState(false);
+  const [phraseFlyoutOpen, setPhraseFlyoutOpen] = useState(true);
   const [transcriptLines, setTranscriptLines] = useState<string[]>([]);
   const [pendingLineCount, setPendingLineCount] = useState(0);
   const [followLive, setFollowLive] = useState(true);
@@ -100,6 +132,7 @@ export function App() {
   const isStopConfirmVisible = stopConfirmOpen && isListening;
   const isSystemPermissionModalVisible =
     systemPermissionModalOpen && systemPermissionStatus !== "unsupported";
+  const isIntegrationModalVisible = integrationModalOpen;
   const isModelMissing = snapshot.state === "model_missing";
   const isDownloadingModel = snapshot.state === "downloading_model" || modelDownload.in_progress;
   const baseModelPromptVisible =
@@ -126,6 +159,7 @@ export function App() {
     isAwaitingDecision ||
     isStopConfirmVisible ||
     isSystemPermissionModalVisible ||
+    isIntegrationModalVisible ||
     sessionActionPending !== null;
   const startActionDisabled =
     controlsLocked ||
@@ -153,6 +187,20 @@ export function App() {
   const selectedModelDownloadable = selectedCatalogModel?.downloadable ?? false;
   const isModelSwitchDisabled = isDownloadingModel || modelActionPending !== false;
   const isModelDeleteDisabled = isListening || isDownloadingModel || modelActionPending !== false;
+  const integrationRequiresKey =
+    integrationSettingsDraft.asr_provider === "google_cloud" ||
+    integrationSettingsDraft.translation_provider === "google_cloud";
+  const integrationApiKey = integrationSettingsDraft.google_api_key ?? "";
+  const sourceModeSummary = getListeningSourceSummary(micEnabled, systemEnabled);
+  const activeSystemPermissionWarning =
+    systemEnabled && systemPermissionStatus === "denied"
+      ? "System audio permission is not enabled yet. Use the startup prompt to enable Screen & System Audio Recording for Kiku."
+      : systemEnabled && systemPermissionNeedsRestart
+        ? "Screen & System Audio Recording was enabled. Restart Kiku to activate system audio capture."
+        : null;
+  const sourceModeReadyMessage = hasEnabledSource
+    ? `${currentModelName} is active. Live ${formatLanguageLabel(languageConfig.source_language)} to ${formatLanguageLabel(languageConfig.target_language)} transcription is ready.`
+    : "Enable Mic and/or System to start listening.";
 
   useEffect(() => {
     if (!isModelMissing && !isDownloadingModel) {
@@ -202,6 +250,8 @@ export function App() {
     void refreshSources();
     void refreshModelDownloadProgress();
     void refreshLanguageConfig();
+    void refreshIntegrationSettings();
+    void refreshStreamingTranslationMode();
     void refreshModelCatalog();
     void refreshModelInventory(true);
     void ensureSystemAudioPermissionReadyOnStartup();
@@ -244,14 +294,20 @@ export function App() {
         return;
       }
       inFlight = true;
-      void Promise.all([getAudioLevel(), pollLiveTranscriptLines()])
-        .then(([level, lines]) => {
-          const normalizedLevel = Math.max(0, Math.min(1, level));
-          setAudioLevel(normalizedLevel);
-          appendLiveTranscriptLines(lines);
-        })
-        .catch((requestError) => {
-          setError(String(requestError));
+      void Promise.allSettled([getAudioLevel(), pollLiveTranscriptLines()])
+        .then(([levelResult, linesResult]) => {
+          if (levelResult.status === "fulfilled") {
+            const normalizedLevel = Math.max(0, Math.min(1, levelResult.value));
+            setAudioLevel(normalizedLevel);
+          } else {
+            setError(String(levelResult.reason));
+          }
+
+          if (linesResult.status === "fulfilled") {
+            appendLiveTranscriptLines(linesResult.value);
+          } else {
+            setError(String(linesResult.reason));
+          }
         })
         .finally(() => {
           inFlight = false;
@@ -375,6 +431,25 @@ export function App() {
   async function refreshLanguageConfig(): Promise<void> {
     try {
       setLanguageConfigState(await getLanguageConfig());
+      setError(null);
+    } catch (requestError) {
+      setError(String(requestError));
+    }
+  }
+
+  async function refreshIntegrationSettings(): Promise<void> {
+    try {
+      const settings = await getIntegrationSettings();
+      setIntegrationSettingsDraft(normalizeIntegrationSettings(settings));
+      setError(null);
+    } catch (requestError) {
+      setError(String(requestError));
+    }
+  }
+
+  async function refreshStreamingTranslationMode(): Promise<void> {
+    try {
+      setStreamingTranslationEnabledState(await getStreamingTranslationEnabled());
       setError(null);
     } catch (requestError) {
       setError(String(requestError));
@@ -595,6 +670,35 @@ export function App() {
     }
   }
 
+  async function onOpenIntegrationModal(): Promise<void> {
+    await refreshIntegrationSettings();
+    setIntegrationModalOpen(true);
+  }
+
+  function onDismissIntegrationModal(): void {
+    setIntegrationModalOpen(false);
+  }
+
+  async function onSaveIntegrationSettings(): Promise<void> {
+    if (integrationSaving) {
+      return;
+    }
+
+    setIntegrationSaving(true);
+    try {
+      const normalizedDraft = normalizeIntegrationSettings(integrationSettingsDraft);
+      const updated = await saveIntegrationSettings(normalizedDraft);
+      setIntegrationSettingsDraft(normalizeIntegrationSettings(updated));
+      await refreshSnapshot();
+      setError(null);
+      setIntegrationModalOpen(false);
+    } catch (requestError) {
+      setError(String(requestError));
+    } finally {
+      setIntegrationSaving(false);
+    }
+  }
+
   async function onSourceLanguageChange(nextSource: AsrLanguage): Promise<void> {
     try {
       setLanguageConfigState(
@@ -644,15 +748,26 @@ export function App() {
     }
 
     const shouldAutoScroll = followLiveRef.current;
-    const formatted = lines.map(
-      (line) => `[${formatTimestamp(line.timestamp_ms)}] [${formatSource(line.source)}] ${line.text}`
-    );
+    const appendedLineCount = lines.filter((line) => (line.mutation ?? "append") === "append").length;
 
-    setTranscriptLines((existing) => [...existing.slice(-180), ...formatted]);
+    setTranscriptLines((existing) => {
+      const next = [...existing];
+      for (const line of lines) {
+        const formatted = `[${formatTimestamp(line.timestamp_ms)}] [${formatSource(line.source)}] ${line.text}`;
+        const mutation = line.mutation ?? "append";
+        if (mutation === "replace_last" && next.length > 0) {
+          next[next.length - 1] = formatted;
+        } else {
+          next.push(formatted);
+        }
+      }
+      return next.slice(-180);
+    });
+
     if (shouldAutoScroll) {
       window.requestAnimationFrame(() => scrollToLatest());
-    } else {
-      setPendingLineCount((count) => count + lines.length);
+    } else if (appendedLineCount > 0) {
+      setPendingLineCount((count) => count + appendedLineCount);
     }
   }
 
@@ -693,6 +808,24 @@ export function App() {
       setError(null);
     } catch (requestError) {
       setError(String(requestError));
+    }
+  }
+
+  async function onToggleStreamingTranslation(): Promise<void> {
+    if (streamingModePending) {
+      return;
+    }
+
+    setStreamingModePending(true);
+    try {
+      const next = await setStreamingTranslationMode(!streamingTranslationEnabled);
+      setStreamingTranslationEnabledState(next);
+      setError(null);
+    } catch (requestError) {
+      setError(String(requestError));
+      await refreshStreamingTranslationMode();
+    } finally {
+      setStreamingModePending(false);
     }
   }
 
@@ -825,14 +958,12 @@ export function App() {
   return (
     <>
       <main
-        className={`layout ${isAwaitingDecision || isStopConfirmVisible || isSystemPermissionModalVisible || isModelPromptVisible ? "modal-active" : ""}`}
+        className={`layout ${isAwaitingDecision || isStopConfirmVisible || isSystemPermissionModalVisible || isIntegrationModalVisible || isModelPromptVisible ? "modal-active" : ""} ${phraseFlyoutOpen ? "phrase-flyout-open" : ""}`}
       >
         <header className="topbar">
           <div className="topbar-left">
             <div className="brand">
-              <span className="glyph" aria-hidden>
-                聴
-              </span>
+              <img src={kikuLogoMatte} className="brand-logo" alt="Kiku logo" draggable={false} />
               <div>
                 <p className="title">Kiku</p>
                 <p className="subtitle">Local Live Captions</p>
@@ -912,6 +1043,20 @@ export function App() {
               >
                 Models
               </button>
+              <button
+                className="button secondary"
+                onClick={() => void onOpenIntegrationModal()}
+                disabled={isAwaitingDecision || integrationSaving}
+              >
+                Cloud
+              </button>
+              <button
+                className={`button toggle ${phraseFlyoutOpen ? "active" : ""}`}
+                onClick={() => setPhraseFlyoutOpen((open) => !open)}
+                disabled={isAwaitingDecision}
+              >
+                Phrase Lab
+              </button>
             </div>
             <button
               className="button primary"
@@ -960,25 +1105,9 @@ export function App() {
             </p>
           ) : isModelMissing ? (
             <p>Model setup is required before listening can start. Use the in-app download prompt.</p>
-          ) : systemPermissionStatus === "denied" ? (
-            <p>
-              System audio permission is not enabled yet. Use the startup prompt to enable Screen
-              &amp; System Audio Recording for Kiku.
-            </p>
-          ) : systemPermissionNeedsRestart ? (
-            <p>
-              Screen &amp; System Audio Recording was enabled. Restart Kiku to activate system
-              audio capture.
-            </p>
-          ) : systemEnabled && !micEnabled ? (
-            <p>
-              System-source mode is active. Kiku captures playback audio directly from macOS so
-              same-device meetings can be transcribed without using the microphone.
-            </p>
           ) : (
             <p>
-              {currentModelName} is active. Live {formatLanguageLabel(languageConfig.source_language)} to{" "}
-              {formatLanguageLabel(languageConfig.target_language)} transcription is ready.
+              {sourceModeSummary} {activeSystemPermissionWarning ?? sourceModeReadyMessage}
             </p>
           )}
         </section>
@@ -1061,6 +1190,27 @@ export function App() {
                   </div>
                 </div>
               </div>
+              <div className="streaming-toggle-row">
+                <p className="streaming-toggle-label">Streaming translation</p>
+                <button
+                  className={`streaming-toggle-button ${streamingTranslationEnabled ? "active" : ""}`}
+                  onClick={() => void onToggleStreamingTranslation()}
+                  disabled={streamingModePending}
+                  aria-pressed={streamingTranslationEnabled}
+                  title="Emit quicker partial captions and auto-correct recent line as context improves."
+                >
+                  {streamingModePending
+                    ? "Updating..."
+                    : streamingTranslationEnabled
+                      ? "On"
+                      : "Off"}
+                </button>
+              </div>
+              <p className="streaming-toggle-note">
+                {streamingTranslationEnabled
+                  ? "Fast partial output + auto-corrections"
+                  : "Sentence-stable output (fewer mid-line changes)"}
+              </p>
               <p className="widget-subtitle">{isListening ? "Live input level" : "Waiting for input"}</p>
             </div>
           </div>
@@ -1076,6 +1226,8 @@ export function App() {
         {error || snapshot.last_error ? (
           <p className="error">{error ?? snapshot.last_error}</p>
         ) : null}
+
+        <PhraseTestFlyout open={phraseFlyoutOpen} onClose={() => setPhraseFlyoutOpen(false)} />
       </main>
 
       {isSystemPermissionModalVisible ? (
@@ -1173,6 +1325,90 @@ export function App() {
                 disabled={permissionActionPending === "restart"}
               >
                 Not Now
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {isIntegrationModalVisible ? (
+        <section className="decision-modal-backdrop" role="presentation">
+          <div
+            className="decision-modal integration-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="integration-settings-title"
+          >
+            <h2 id="integration-settings-title">Cloud Provider Settings</h2>
+            <p>
+              Configure ASR and translation providers and set your Google API key.
+            </p>
+            <label className="integration-field">
+              <span>ASR Provider</span>
+              <select
+                value={integrationSettingsDraft.asr_provider}
+                onChange={(event) =>
+                  setIntegrationSettingsDraft((current) => ({
+                    ...current,
+                    asr_provider: event.currentTarget.value as AsrProvider
+                  }))
+                }
+              >
+                <option value="local">Local Whisper</option>
+                <option value="google_cloud">Google Cloud Speech-to-Text</option>
+              </select>
+            </label>
+            <label className="integration-field">
+              <span>Translation Provider</span>
+              <select
+                value={integrationSettingsDraft.translation_provider}
+                onChange={(event) =>
+                  setIntegrationSettingsDraft((current) => ({
+                    ...current,
+                    translation_provider: event.currentTarget.value as IntegrationSettings["translation_provider"]
+                  }))
+                }
+              >
+                <option value="local">Local / Stub</option>
+                <option value="google_cloud">Google Cloud Translate</option>
+              </select>
+            </label>
+            <label className="integration-field">
+              <span>Google API Key</span>
+              <input
+                type="password"
+                value={integrationApiKey}
+                onChange={(event) =>
+                  setIntegrationSettingsDraft((current) => ({
+                    ...current,
+                    google_api_key: event.currentTarget.value
+                  }))
+                }
+                placeholder="AIza..."
+                autoComplete="off"
+              />
+            </label>
+            <p className="integration-note">
+              Key is currently stored in runtime memory for this dev session. For persistent setup,
+              export env vars before `pnpm start`.
+            </p>
+            <div className="decision-buttons">
+              <button
+                className="button secondary"
+                onClick={onDismissIntegrationModal}
+                disabled={integrationSaving}
+              >
+                Cancel
+              </button>
+              <button
+                className="button primary"
+                onClick={() => void onSaveIntegrationSettings()}
+                disabled={
+                  integrationSaving ||
+                  (integrationRequiresKey && integrationApiKey.trim().length === 0)
+                }
+              >
+                {integrationSaving ? "Saving..." : "Save Providers"}
               </button>
             </div>
           </div>
@@ -1446,6 +1682,19 @@ function getSessionStatus(state: SessionSnapshot["state"]): {
     default:
       return { label: "Session: Idle", tone: "muted" };
   }
+}
+
+function getListeningSourceSummary(micEnabled: boolean, systemEnabled: boolean): string {
+  if (micEnabled && systemEnabled) {
+    return "Mic + System mode is active. Kiku will capture both microphone input and macOS playback audio.";
+  }
+  if (micEnabled) {
+    return "Mic mode is active. Kiku will capture speech from your microphone.";
+  }
+  if (systemEnabled) {
+    return "System mode is active. Kiku will capture playback audio directly from macOS.";
+  }
+  return "No listening source is currently active.";
 }
 
 function createMeterSegments(litSegments: number, enabled: boolean, listening: boolean) {

@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use kiku_asr::{AsrRuntime, Language, StubAsrRuntime, WhisperAsrRuntime};
+use kiku_asr::{AsrRuntime, GoogleCloudAsrRuntime, Language, StubAsrRuntime, WhisperAsrRuntime};
 use kiku_core::{
     AppController, CaptureSourceState, CoreError, LanguageConfig, LiveTranscriptLine,
     SessionSnapshot, SessionState,
@@ -13,7 +13,8 @@ use kiku_platform::{
 use kiku_privacy::InMemoryPrivacyGuard;
 use kiku_settings::InMemorySettingsStore;
 use kiku_transcript::SourceIcon;
-use serde::Serialize;
+use kiku_translate::{GoogleCloudTranslator, StubTranslator, Translator};
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +36,27 @@ enum AppRestartOutcome {
     #[cfg(not(debug_assertions))]
     Restarting,
     ManualRequired,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AsrProvider {
+    Local,
+    GoogleCloud,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TranslationProvider {
+    Local,
+    GoogleCloud,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IntegrationSettings {
+    asr_provider: AsrProvider,
+    translation_provider: TranslationProvider,
+    google_api_key: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,6 +295,7 @@ struct DesktopState {
     model_download: Arc<Mutex<ModelDownloadState>>,
     model_root: PathBuf,
     active_model_id: Arc<Mutex<Option<String>>>,
+    integration_settings: Arc<Mutex<IntegrationSettings>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -461,6 +484,47 @@ fn get_language_config(state: State<DesktopState>) -> Result<LanguageConfig, Str
 }
 
 #[tauri::command]
+fn get_integration_settings(state: State<DesktopState>) -> Result<IntegrationSettings, String> {
+    state
+        .integration_settings
+        .lock()
+        .map(|settings| settings.clone())
+        .map_err(|_| "integration settings lock poisoned".to_owned())
+}
+
+#[tauri::command]
+fn set_integration_settings(
+    state: State<DesktopState>,
+    settings: IntegrationSettings,
+) -> Result<IntegrationSettings, String> {
+    apply_integration_settings(&state, &settings)?;
+    let mut stored = state
+        .integration_settings
+        .lock()
+        .map_err(|_| "integration settings lock poisoned".to_owned())?;
+    *stored = settings.clone();
+    persist_integration_env(&settings);
+    Ok(settings)
+}
+
+#[tauri::command]
+fn get_streaming_translation_enabled(state: State<DesktopState>) -> Result<bool, String> {
+    with_controller(&state, |controller| {
+        Ok(controller.streaming_translation_enabled())
+    })
+}
+
+#[tauri::command]
+fn set_streaming_translation_enabled(
+    state: State<DesktopState>,
+    enabled: bool,
+) -> Result<bool, String> {
+    with_controller(&state, |controller| {
+        controller.set_streaming_translation_enabled(enabled)
+    })
+}
+
+#[tauri::command]
 fn set_language_config(
     state: State<DesktopState>,
     source_language: Language,
@@ -579,7 +643,7 @@ fn delete_model(
                 .controller
                 .lock()
                 .map_err(|_| "controller lock poisoned".to_owned())?;
-            controller.set_asr_runtime(Arc::new(StubAsrRuntime::default()));
+            controller.set_asr_runtime(Arc::new(StubAsrRuntime));
             controller.mark_model_missing();
             let mut active_id = state
                 .active_model_id
@@ -973,21 +1037,177 @@ fn with_controller<T>(
     op(&mut controller).map_err(|error| error.to_string())
 }
 
-fn build_controller() -> AppController {
-    let settings = Arc::new(InMemorySettingsStore::default());
-    let (asr, model_installed): (Arc<dyn AsrRuntime>, bool) =
-        match WhisperAsrRuntime::from_default_model_locations() {
-            Ok(runtime) => (Arc::new(runtime), true),
-            Err(error) => {
-                eprintln!("kiku asr runtime fallback: {error}");
-                (Arc::new(StubAsrRuntime::default()), false)
+fn normalize_google_api_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn parse_asr_provider(raw: &str) -> AsrProvider {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "google" | "google_cloud" | "google_speech" => AsrProvider::GoogleCloud,
+        _ => AsrProvider::Local,
+    }
+}
+
+fn parse_translation_provider(raw: &str) -> TranslationProvider {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "google" | "google_cloud" => TranslationProvider::GoogleCloud,
+        _ => TranslationProvider::Local,
+    }
+}
+
+fn initial_integration_settings_from_env() -> IntegrationSettings {
+    let asr_provider = std::env::var("KIKU_ASR_PROVIDER")
+        .ok()
+        .map(|raw| parse_asr_provider(&raw))
+        .unwrap_or(AsrProvider::Local);
+    let translation_provider = std::env::var("KIKU_TRANSLATION_PROVIDER")
+        .ok()
+        .map(|raw| parse_translation_provider(&raw))
+        .unwrap_or(TranslationProvider::Local);
+    let google_api_key = std::env::var("KIKU_GOOGLE_SPEECH_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("KIKU_GOOGLE_API_KEY").ok())
+        .or_else(|| std::env::var("KIKU_GOOGLE_TRANSLATE_API_KEY").ok())
+        .and_then(|raw| normalize_google_api_key(&raw))
+        .unwrap_or_default();
+
+    IntegrationSettings {
+        asr_provider,
+        translation_provider,
+        google_api_key,
+    }
+}
+
+fn build_translator_from_settings(
+    settings: &IntegrationSettings,
+    allow_fallback: bool,
+) -> Result<Arc<dyn Translator>, String> {
+    match settings.translation_provider {
+        TranslationProvider::Local => Ok(Arc::new(StubTranslator)),
+        TranslationProvider::GoogleCloud => {
+            let api_key = normalize_google_api_key(&settings.google_api_key)
+                .ok_or_else(|| "Google translation provider requires an API key".to_owned())?;
+            match GoogleCloudTranslator::new(api_key) {
+                Ok(translator) => Ok(Arc::new(translator)),
+                Err(error) if allow_fallback => {
+                    eprintln!("kiku translator fallback to stub: {error}");
+                    Ok(Arc::new(StubTranslator))
+                }
+                Err(error) => Err(error.to_string()),
             }
-        };
+        }
+    }
+}
+
+fn build_asr_runtime_from_settings(
+    settings: &IntegrationSettings,
+    allow_fallback: bool,
+) -> Result<(Arc<dyn AsrRuntime>, bool), String> {
+    match settings.asr_provider {
+        AsrProvider::GoogleCloud => {
+            let api_key = normalize_google_api_key(&settings.google_api_key)
+                .ok_or_else(|| "Google ASR provider requires an API key".to_owned())?;
+            match GoogleCloudAsrRuntime::new(api_key) {
+                Ok(runtime) => Ok((Arc::new(runtime), true)),
+                Err(error) if allow_fallback => {
+                    eprintln!("kiku asr fallback to whisper: {error}");
+                    match WhisperAsrRuntime::from_default_model_locations() {
+                        Ok(runtime) => Ok((Arc::new(runtime), true)),
+                        Err(whisper_error) => {
+                            eprintln!("kiku asr runtime fallback: {whisper_error}");
+                            Ok((Arc::new(StubAsrRuntime), false))
+                        }
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        AsrProvider::Local => match WhisperAsrRuntime::from_default_model_locations() {
+            Ok(runtime) => Ok((Arc::new(runtime), true)),
+            Err(error) if allow_fallback => {
+                eprintln!("kiku asr runtime fallback: {error}");
+                Ok((Arc::new(StubAsrRuntime), false))
+            }
+            Err(error) => Err(error.to_string()),
+        },
+    }
+}
+
+fn apply_integration_settings(
+    state: &State<DesktopState>,
+    settings: &IntegrationSettings,
+) -> Result<(), String> {
+    let translator = build_translator_from_settings(settings, false)?;
+    let (asr_runtime, model_installed) = build_asr_runtime_from_settings(settings, false)?;
+
+    let mut controller = state
+        .controller
+        .lock()
+        .map_err(|_| "controller lock poisoned".to_owned())?;
+    controller.set_translator(translator);
+    controller.set_asr_runtime(asr_runtime);
+
+    let session_state = controller.session_snapshot().state;
+    if settings.asr_provider == AsrProvider::GoogleCloud {
+        if session_state == SessionState::ModelMissing {
+            controller.recover_ready();
+        }
+    } else if !model_installed {
+        controller.mark_model_missing();
+    }
+
+    Ok(())
+}
+
+fn persist_integration_env(settings: &IntegrationSettings) {
+    std::env::set_var(
+        "KIKU_ASR_PROVIDER",
+        match settings.asr_provider {
+            AsrProvider::Local => "local",
+            AsrProvider::GoogleCloud => "google_cloud",
+        },
+    );
+    std::env::set_var(
+        "KIKU_TRANSLATION_PROVIDER",
+        match settings.translation_provider {
+            TranslationProvider::Local => "local",
+            TranslationProvider::GoogleCloud => "google_cloud",
+        },
+    );
+
+    if let Some(api_key) = normalize_google_api_key(&settings.google_api_key) {
+        std::env::set_var("KIKU_GOOGLE_SPEECH_API_KEY", &api_key);
+        std::env::set_var("KIKU_GOOGLE_TRANSLATE_API_KEY", &api_key);
+        std::env::set_var("KIKU_GOOGLE_API_KEY", &api_key);
+    } else {
+        std::env::remove_var("KIKU_GOOGLE_SPEECH_API_KEY");
+        std::env::remove_var("KIKU_GOOGLE_TRANSLATE_API_KEY");
+        std::env::remove_var("KIKU_GOOGLE_API_KEY");
+    }
+}
+
+fn build_controller(integration_settings: &IntegrationSettings) -> AppController {
+    let settings = Arc::new(InMemorySettingsStore::default());
+    let translator =
+        build_translator_from_settings(integration_settings, true).unwrap_or_else(|error| {
+            eprintln!("kiku translator fallback to stub: {error}");
+            Arc::new(StubTranslator)
+        });
+    let (asr, model_installed) = build_asr_runtime_from_settings(integration_settings, true)
+        .unwrap_or_else(|error| {
+            eprintln!("kiku asr runtime fallback: {error}");
+            (Arc::new(StubAsrRuntime), false)
+        });
     let models = Arc::new(InMemoryModelManager::new(model_installed));
     let capture = Arc::new(CpalCaptureBackend::default());
     let privacy = Arc::new(InMemoryPrivacyGuard::default());
 
-    let mut controller = AppController::new(settings, models, asr, capture, privacy);
+    let mut controller = AppController::new(settings, models, asr, capture, privacy, translator);
     if let Err(error) = controller.boot() {
         controller.fail_session(error.to_string());
     }
@@ -1051,6 +1271,10 @@ fn main() {
             get_audio_level,
             get_language_config,
             set_language_config,
+            get_integration_settings,
+            set_integration_settings,
+            get_streaming_translation_enabled,
+            set_streaming_translation_enabled,
             poll_live_transcript_lines,
             get_model_catalog,
             get_model_inventory,
@@ -1063,6 +1287,7 @@ fn main() {
         .setup(|app| {
             let model_path = resolve_model_path(app.handle());
             std::env::set_var("KIKU_WHISPER_MODEL", &model_path);
+            let integration_settings = initial_integration_settings_from_env();
             let model_root = model_path
                 .parent()
                 .map(Path::to_path_buf)
@@ -1073,7 +1298,7 @@ fn main() {
                 None
             };
 
-            let controller = build_controller();
+            let controller = build_controller(&integration_settings);
             let is_model_installed =
                 matches!(controller.session_snapshot().state, SessionState::Ready);
 
@@ -1090,6 +1315,7 @@ fn main() {
                 })),
                 model_root,
                 active_model_id: Arc::new(Mutex::new(initial_active_model_id)),
+                integration_settings: Arc::new(Mutex::new(integration_settings)),
             });
 
             if let Some(window) = app.get_webview_window("main") {

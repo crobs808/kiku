@@ -1,3 +1,6 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -33,6 +36,12 @@ pub enum AsrError {
     BackendUnavailable,
     #[error("asr model unavailable: {0}")]
     ModelUnavailable(String),
+    #[error("asr configuration missing: {0}")]
+    Configuration(String),
+    #[error("asr request failed: {0}")]
+    RequestFailed(String),
+    #[error("asr response invalid: {0}")]
+    InvalidResponse(String),
     #[error("asr inference failed: {0}")]
     InferenceFailed(String),
 }
@@ -41,6 +50,10 @@ pub type AsrResult<T> = Result<T, AsrError>;
 
 pub trait AsrRuntime: Send + Sync {
     fn infer(&self, request: &AsrRequest) -> AsrResult<AsrOutput>;
+
+    fn uses_network(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +71,143 @@ impl AsrRuntime for StubAsrRuntime {
             ),
             confidence: 0.25,
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct GoogleCloudAsrRuntime {
+    api_key: String,
+    client: Client,
+}
+
+impl std::fmt::Debug for GoogleCloudAsrRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleCloudAsrRuntime")
+            .finish_non_exhaustive()
+    }
+}
+
+impl GoogleCloudAsrRuntime {
+    pub fn new(api_key: impl Into<String>) -> AsrResult<Self> {
+        let api_key = api_key.into();
+        let trimmed = api_key.trim();
+        if trimmed.is_empty() {
+            return Err(AsrError::Configuration(
+                "KIKU_GOOGLE_SPEECH_API_KEY is empty".to_owned(),
+            ));
+        }
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|error| AsrError::RequestFailed(error.to_string()))?;
+
+        Ok(Self {
+            api_key: trimmed.to_owned(),
+            client,
+        })
+    }
+}
+
+impl AsrRuntime for GoogleCloudAsrRuntime {
+    fn infer(&self, request: &AsrRequest) -> AsrResult<AsrOutput> {
+        if request.audio_samples.is_empty() {
+            return Ok(AsrOutput {
+                transcript: String::new(),
+                confidence: 0.0,
+            });
+        }
+
+        let pcm = resample_to_target_rate(&request.audio_samples, request.sample_rate_hz);
+        if pcm.len() < TARGET_SAMPLE_RATE_HZ as usize / 2 {
+            return Ok(AsrOutput {
+                transcript: String::new(),
+                confidence: 0.0,
+            });
+        }
+
+        let linear16 = pcm_to_linear16_bytes(&pcm);
+        let content = BASE64_STANDARD.encode(linear16);
+        let payload = GoogleSpeechRequest {
+            config: GoogleSpeechConfig {
+                encoding: "LINEAR16",
+                sample_rate_hertz: TARGET_SAMPLE_RATE_HZ,
+                language_code: google_language_code(request.source_language),
+                enable_automatic_punctuation: true,
+                model: "latest_long",
+            },
+            audio: GoogleSpeechAudio { content },
+        };
+        let url = format!(
+            "https://speech.googleapis.com/v1/speech:recognize?key={}",
+            self.api_key
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .map_err(|error| AsrError::RequestFailed(error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .map_err(|error| AsrError::RequestFailed(error.to_string()))?;
+
+        if !status.is_success() {
+            if let Ok(api_error) = serde_json::from_str::<GoogleSpeechErrorEnvelope>(&body) {
+                return Err(AsrError::RequestFailed(format!(
+                    "google speech api error {}: {}",
+                    status, api_error.error.message
+                )));
+            }
+
+            return Err(AsrError::RequestFailed(format!(
+                "google speech api returned {}: {}",
+                status,
+                truncate_for_error(&body)
+            )));
+        }
+
+        let parsed: GoogleSpeechResponse = serde_json::from_str(&body)
+            .map_err(|error| AsrError::InvalidResponse(error.to_string()))?;
+
+        let mut transcript_parts = Vec::new();
+        let mut confidence = 0.0f32;
+        let mut confidence_count = 0usize;
+
+        for result in parsed.results.unwrap_or_default() {
+            if let Some(first) = result.alternatives.into_iter().next() {
+                let cleaned = first.transcript.trim();
+                if !cleaned.is_empty() {
+                    transcript_parts.push(cleaned.to_owned());
+                }
+                if let Some(value) = first.confidence {
+                    confidence += value;
+                    confidence_count += 1;
+                }
+            }
+        }
+
+        let transcript = transcript_parts.join(" ");
+        let avg_confidence = if confidence_count == 0 {
+            if transcript.is_empty() {
+                0.0
+            } else {
+                0.65
+            }
+        } else {
+            confidence / confidence_count as f32
+        };
+
+        Ok(AsrOutput {
+            transcript,
+            confidence: avg_confidence,
+        })
+    }
+
+    fn uses_network(&self) -> bool {
+        true
     }
 }
 
@@ -150,10 +300,9 @@ impl AsrRuntime for WhisperAsrRuntime {
             matches!(request.source_language, Language::Japanese)
                 && matches!(request.target_language, Language::English),
         );
-        params.set_language(Some(match request.source_language {
-            Language::Japanese => "ja",
-            Language::English => "en",
-        }));
+        // Use Whisper language auto-detection to avoid hard failures when the selected
+        // source language does not exactly match the incoming audio.
+        params.set_language(None);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_special(false);
@@ -184,6 +333,86 @@ impl AsrRuntime for WhisperAsrRuntime {
                 0.82
             },
         })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GoogleSpeechRequest {
+    config: GoogleSpeechConfig<'static>,
+    audio: GoogleSpeechAudio,
+}
+
+#[derive(Debug, Serialize)]
+struct GoogleSpeechConfig<'a> {
+    encoding: &'a str,
+    #[serde(rename = "sampleRateHertz")]
+    sample_rate_hertz: u32,
+    #[serde(rename = "languageCode")]
+    language_code: &'a str,
+    #[serde(rename = "enableAutomaticPunctuation")]
+    enable_automatic_punctuation: bool,
+    model: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct GoogleSpeechAudio {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleSpeechResponse {
+    results: Option<Vec<GoogleSpeechResult>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleSpeechResult {
+    alternatives: Vec<GoogleSpeechAlternative>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleSpeechAlternative {
+    transcript: String,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleSpeechErrorEnvelope {
+    error: GoogleSpeechError,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleSpeechError {
+    message: String,
+}
+
+fn google_language_code(language: Language) -> &'static str {
+    match language {
+        Language::Japanese => "ja-JP",
+        Language::English => "en-US",
+    }
+}
+
+fn pcm_to_linear16_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let scaled = if clamped <= -1.0 {
+            i16::MIN
+        } else {
+            (clamped * i16::MAX as f32).round() as i16
+        };
+        bytes.extend_from_slice(&scaled.to_le_bytes());
+    }
+    bytes
+}
+
+fn truncate_for_error(message: &str) -> String {
+    const MAX_LEN: usize = 240;
+    let normalized = message.trim().replace('\n', " ");
+    if normalized.len() <= MAX_LEN {
+        normalized
+    } else {
+        format!("{}...", &normalized[..MAX_LEN])
     }
 }
 

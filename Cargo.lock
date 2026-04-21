@@ -1893,16 +1893,19 @@ dependencies = [
 
 [[package]]
 name = "kiku-asr"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
+ "base64 0.22.1",
+ "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "whisper-rs",
 ]
 
 [[package]]
 name = "kiku-audio"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "kiku-platform",
  "serde",
@@ -1910,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "kiku-core"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "kiku-asr",
  "kiku-models",
@@ -1925,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "kiku-desktop"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "kiku-asr",
  "kiku-core",
@@ -1934,6 +1937,7 @@ dependencies = [
  "kiku-privacy",
  "kiku-settings",
  "kiku-transcript",
+ "kiku-translate",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1944,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "kiku-models"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -1952,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "kiku-platform"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "cpal",
  "serde",
@@ -1961,14 +1965,14 @@ dependencies = [
 
 [[package]]
 name = "kiku-privacy"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "kiku-settings"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -1976,22 +1980,24 @@ dependencies = [
 
 [[package]]
 name = "kiku-transcript"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "kiku-translate"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
+ "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "kiku-visualizer"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
 ]

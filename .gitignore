@@ -2,7 +2,9 @@
 .DS_Store
 
 # Editor / IDE
-.vscode/
+.vscode/*
+!.vscode/
+!.vscode/tasks.json
 .idea/
 *.swp
 *.swo
@@ -46,6 +48,12 @@ src-tauri/gen/
 *.msi
 *.deb
 *.AppImage
+
+# Tauri icon generation artifacts (keep canonical desktop icons tracked)
+apps/desktop/src-tauri/icons/*
+!apps/desktop/src-tauri/icons/icon.png
+!apps/desktop/src-tauri/icons/icon.icns
+!apps/desktop/src-tauri/icons/icon.ico
 
 # Android
 .gradle/

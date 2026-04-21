@@ -7,7 +7,25 @@
     "dev": "pnpm start",
     "ui:dev": "pnpm --dir apps/desktop/ui dev",
     "ui:build": "pnpm --dir apps/desktop/ui build",
+    "version:next": "node scripts/release/auto-semver.mjs",
+    "version:prepare": "node scripts/release/auto-semver.mjs --apply",
+    "build:mac": "pnpm build:mac:arm64:dmg",
+    "build:mac:arm64:dmg": "pnpm version:prepare && pnpm --dir apps/desktop exec tauri build --target aarch64-apple-darwin --bundles app,dmg",
+    "build:mac:universal:dmg": "pnpm version:prepare && pnpm --dir apps/desktop exec tauri build --target universal-apple-darwin --bundles app,dmg",
+    "build:win": "pnpm build:win:x64:exe",
+    "build:win:x64:exe": "pnpm version:prepare && pnpm --dir apps/desktop exec tauri build --target x86_64-pc-windows-msvc --bundles nsis",
+    "build:win:x64:msi": "pnpm version:prepare && pnpm --dir apps/desktop exec tauri build --target x86_64-pc-windows-msvc --bundles msi",
+    "build:linux": "pnpm build:linux:x64:appimage",
+    "build:linux:x64:appimage": "pnpm version:prepare && pnpm --dir apps/desktop exec tauri build --target x86_64-unknown-linux-gnu --bundles appimage",
+    "build:android": "pnpm build:android:apk:release",
+    "build:android:apk:debug": "./scripts/release/build-android.sh apk debug",
+    "build:android:apk:release": "./scripts/release/build-android.sh apk release",
+    "build:android:aab:release": "./scripts/release/build-android.sh aab release",
+    "check": "pnpm check:quick",
+    "check:quick": "./scripts/dev/check.sh --quick",
+    "check:full": "./scripts/dev/check.sh --full",
+    "hooks:install": "./scripts/dev/install-hooks.sh",
     "bundle:prototype": "pnpm bundle:mac:prototype",
-    "bundle:mac:prototype": "pnpm --dir apps/desktop build"
+    "bundle:mac:prototype": "pnpm version:prepare && pnpm --dir apps/desktop build"
   }
 }

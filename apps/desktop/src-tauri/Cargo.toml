@@ -16,6 +16,7 @@ kiku-platform = { path = "../../../crates/kiku-platform" }
 kiku-privacy = { path = "../../../crates/kiku-privacy" }
 kiku-settings = { path = "../../../crates/kiku-settings" }
 kiku-transcript = { path = "../../../crates/kiku-transcript" }
+kiku-translate = { path = "../../../crates/kiku-translate" }
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }

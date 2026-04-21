@@ -746,7 +746,6 @@ fn classify_macos_helper_error(base_error: CaptureError, stderr_log: &str) -> Ca
 
 #[cfg(target_os = "macos")]
 fn prepare_macos_system_audio_helper() -> CaptureResult<PathBuf> {
-    let helper_hash = embedded_helper_hash(EMBEDDED_SYSTEM_AUDIO_HELPER);
     let helper_dir = std::env::temp_dir()
         .join("kiku")
         .join("system-audio-helper");
@@ -757,10 +756,12 @@ fn prepare_macos_system_audio_helper() -> CaptureResult<PathBuf> {
         ))
     })?;
 
-    let helper_path = helper_dir.join(format!("kiku-system-audio-helper-{helper_hash:x}"));
+    // Use a stable helper path so macOS permission grants can persist across
+    // normal dev rebuilds instead of appearing as a brand-new binary each run.
+    let helper_path = helper_dir.join("kiku-system-audio-helper");
     let mut write_binary = true;
-    if let Ok(metadata) = fs::metadata(&helper_path) {
-        if metadata.len() == EMBEDDED_SYSTEM_AUDIO_HELPER.len() as u64 {
+    if let Ok(existing) = fs::read(&helper_path) {
+        if existing == EMBEDDED_SYSTEM_AUDIO_HELPER {
             write_binary = false;
         }
     }
@@ -783,18 +784,6 @@ fn prepare_macos_system_audio_helper() -> CaptureResult<PathBuf> {
     })?;
 
     Ok(helper_path)
-}
-
-#[cfg(target_os = "macos")]
-fn embedded_helper_hash(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
 }
 
 fn build_mic_stream(

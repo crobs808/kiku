@@ -27,6 +27,7 @@ export type LiveTranscriptLine = {
   timestamp_ms: number;
   source: "mic" | "system_audio" | "mixed";
   text: string;
+  mutation?: "append" | "replace_last";
 };
 
 export type ModelDownloadProgress = {
@@ -49,6 +50,25 @@ export type LanguageConfig = {
 
 export type SystemAudioPermissionStatus = "granted" | "denied" | "unsupported";
 export type AppRestartOutcome = "restarting" | "manual_required";
+export type AsrProvider = "local" | "google_cloud";
+export type TranslationProvider = "local" | "google_cloud";
+
+export type IntegrationSettings = {
+  asr_provider: AsrProvider;
+  translation_provider: TranslationProvider;
+  google_api_key: string;
+};
+
+function normalizeIntegrationSettings(
+  settings: Partial<IntegrationSettings> | null | undefined
+): IntegrationSettings {
+  return {
+    asr_provider: settings?.asr_provider === "google_cloud" ? "google_cloud" : "local",
+    translation_provider:
+      settings?.translation_provider === "google_cloud" ? "google_cloud" : "local",
+    google_api_key: typeof settings?.google_api_key === "string" ? settings.google_api_key : ""
+  };
+}
 
 export type ModelOption = {
   id: string;
@@ -76,6 +96,8 @@ const fallback: {
   audioLevel: number;
   modelDownload: ModelDownloadProgress;
   languageConfig: LanguageConfig;
+  streamingTranslationEnabled: boolean;
+  integrationSettings: IntegrationSettings;
   modelCatalog: ModelOption[];
 } = {
   snapshot: {
@@ -102,6 +124,12 @@ const fallback: {
   languageConfig: {
     source_language: "japanese",
     target_language: "english"
+  },
+  streamingTranslationEnabled: false,
+  integrationSettings: {
+    asr_provider: "local",
+    translation_provider: "local",
+    google_api_key: ""
   },
   modelCatalog: [
     {
@@ -417,6 +445,47 @@ export async function setLanguageConfig(
     sourceLanguage,
     targetLanguage
   });
+}
+
+export async function getIntegrationSettings(): Promise<IntegrationSettings> {
+  if (!inTauriRuntime()) {
+    return normalizeIntegrationSettings(fallback.integrationSettings);
+  }
+
+  return normalizeIntegrationSettings(
+    await invoke<IntegrationSettings>("get_integration_settings")
+  );
+}
+
+export async function setIntegrationSettings(
+  settings: IntegrationSettings
+): Promise<IntegrationSettings> {
+  const normalized = normalizeIntegrationSettings(settings);
+  if (!inTauriRuntime()) {
+    fallback.integrationSettings = normalized;
+    return normalizeIntegrationSettings(fallback.integrationSettings);
+  }
+
+  return normalizeIntegrationSettings(
+    await invoke<IntegrationSettings>("set_integration_settings", { settings: normalized })
+  );
+}
+
+export async function getStreamingTranslationEnabled(): Promise<boolean> {
+  if (!inTauriRuntime()) {
+    return fallback.streamingTranslationEnabled;
+  }
+
+  return invoke<boolean>("get_streaming_translation_enabled");
+}
+
+export async function setStreamingTranslationEnabled(enabled: boolean): Promise<boolean> {
+  if (!inTauriRuntime()) {
+    fallback.streamingTranslationEnabled = enabled;
+    return fallback.streamingTranslationEnabled;
+  }
+
+  return invoke<boolean>("set_streaming_translation_enabled", { enabled });
 }
 
 export async function getModelCatalog(): Promise<ModelOption[]> {

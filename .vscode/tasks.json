@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Kiku: Next Version Preview",
+      "type": "shell",
+      "command": "pnpm version:next",
+      "problemMatcher": []
+    },
+    {
+      "label": "Kiku: Build macOS ARM64 DMG (Auto-Version)",
+      "type": "shell",
+      "command": "pnpm build:mac:arm64:dmg",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kiku: Build macOS Universal DMG (Auto-Version)",
+      "type": "shell",
+      "command": "pnpm build:mac:universal:dmg",
+      "problemMatcher": []
+    }
+  ]
+}

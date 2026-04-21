@@ -1,3 +1,4 @@
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -12,6 +13,12 @@ pub enum Language {
 pub enum TranslationError {
     #[error("translator backend unavailable")]
     BackendUnavailable,
+    #[error("translator configuration missing: {0}")]
+    Configuration(String),
+    #[error("translation request failed: {0}")]
+    RequestFailed(String),
+    #[error("translation response invalid: {0}")]
+    InvalidResponse(String),
 }
 
 pub type TranslationResult<T> = Result<T, TranslationError>;
@@ -23,6 +30,10 @@ pub trait Translator: Send + Sync {
         source: Language,
         target: Language,
     ) -> TranslationResult<String>;
+
+    fn uses_network(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Default)]
@@ -45,6 +56,176 @@ impl Translator for StubTranslator {
             _ => Ok(text.to_owned()),
         }
     }
+}
+
+#[derive(Clone)]
+pub struct GoogleCloudTranslator {
+    api_key: String,
+    client: Client,
+}
+
+impl std::fmt::Debug for GoogleCloudTranslator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleCloudTranslator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl GoogleCloudTranslator {
+    pub fn new(api_key: impl Into<String>) -> TranslationResult<Self> {
+        let api_key = api_key.into();
+        let trimmed = api_key.trim();
+        if trimmed.is_empty() {
+            return Err(TranslationError::Configuration(
+                "KIKU_GOOGLE_TRANSLATE_API_KEY is empty".to_owned(),
+            ));
+        }
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .map_err(|error| TranslationError::RequestFailed(error.to_string()))?;
+
+        Ok(Self {
+            api_key: trimmed.to_owned(),
+            client,
+        })
+    }
+}
+
+impl Translator for GoogleCloudTranslator {
+    fn translate(
+        &self,
+        text: &str,
+        source: Language,
+        target: Language,
+    ) -> TranslationResult<String> {
+        if source == target {
+            return Ok(text.to_owned());
+        }
+
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(String::new());
+        }
+
+        let payload = GoogleTranslateRequest {
+            q: trimmed,
+            source: language_code(source),
+            target: language_code(target),
+            format: "text",
+        };
+        let url = format!(
+            "https://translation.googleapis.com/language/translate/v2?key={}",
+            self.api_key
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .map_err(|error| TranslationError::RequestFailed(error.to_string()))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .map_err(|error| TranslationError::RequestFailed(error.to_string()))?;
+
+        if !status.is_success() {
+            if let Ok(api_error) = serde_json::from_str::<GoogleTranslateErrorEnvelope>(&body) {
+                return Err(TranslationError::RequestFailed(format!(
+                    "google api error {}: {}",
+                    status, api_error.error.message
+                )));
+            }
+
+            return Err(TranslationError::RequestFailed(format!(
+                "google api returned {}: {}",
+                status,
+                truncate_for_error(&body)
+            )));
+        }
+
+        let parsed: GoogleTranslateResponse = serde_json::from_str(&body)
+            .map_err(|error| TranslationError::InvalidResponse(error.to_string()))?;
+
+        let translated = parsed
+            .data
+            .translations
+            .into_iter()
+            .next()
+            .map(|entry| decode_html_entities(&entry.translated_text))
+            .ok_or_else(|| {
+                TranslationError::InvalidResponse("missing translatedText in response".to_owned())
+            })?;
+
+        Ok(translated)
+    }
+
+    fn uses_network(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GoogleTranslateRequest<'a> {
+    q: &'a str,
+    source: &'a str,
+    target: &'a str,
+    format: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTranslateResponse {
+    data: GoogleTranslateData,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTranslateData {
+    translations: Vec<GoogleTranslationEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTranslationEntry {
+    #[serde(rename = "translatedText")]
+    translated_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTranslateErrorEnvelope {
+    error: GoogleTranslateError,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTranslateError {
+    message: String,
+}
+
+fn language_code(language: Language) -> &'static str {
+    match language {
+        Language::English => "en",
+        Language::Japanese => "ja",
+    }
+}
+
+fn truncate_for_error(message: &str) -> String {
+    const MAX_LEN: usize = 240;
+    let normalized = message.trim().replace('\n', " ");
+    if normalized.len() <= MAX_LEN {
+        normalized
+    } else {
+        format!("{}...", &normalized[..MAX_LEN])
+    }
+}
+
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn translate_en_to_ja(input: &str) -> String {
@@ -156,7 +337,7 @@ fn translate_ja_to_en(input: &str) -> String {
     let rendered = replace_remaining_japanese_spans(&rendered);
     let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
-        "untranslated".to_owned()
+        trimmed.to_owned()
     } else {
         normalized
     }
@@ -209,24 +390,27 @@ fn replace_remaining_japanese_spans(input: &str) -> String {
         }
 
         if !japanese_span.is_empty() {
-            rendered.push_str(map_japanese_span(&japanese_span));
+            rendered.push_str(&map_japanese_span(&japanese_span));
             japanese_span.clear();
         }
         rendered.push(ch);
     }
 
     if !japanese_span.is_empty() {
-        rendered.push_str(map_japanese_span(&japanese_span));
+        rendered.push_str(&map_japanese_span(&japanese_span));
     }
 
     rendered
 }
 
-fn map_japanese_span(span: &str) -> &'static str {
+fn map_japanese_span(span: &str) -> String {
     ja_to_en_phrase_dictionary()
         .iter()
         .find(|(phrase, _)| *phrase == span)
-        .map_or("untranslated", |(_, translated)| *translated)
+        .map_or_else(
+            || span.to_owned(),
+            |(_, translated)| (*translated).to_owned(),
+        )
 }
 
 fn is_japanese_script(ch: char) -> bool {

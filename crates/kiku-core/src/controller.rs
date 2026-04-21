@@ -7,21 +7,27 @@ use kiku_settings::{
     LanguageCode, LanguagePair as SettingsLanguagePair, SettingsError, SettingsStore,
 };
 use kiku_transcript::{SourceIcon, TranscriptBuffer};
-use kiku_translate::{Language as TranslationLanguage, StubTranslator, Translator};
+use kiku_translate::{Language as TranslationLanguage, Translator};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-const MIN_INFER_INTERVAL: Duration = Duration::from_millis(900);
-const MIN_AUDIO_WINDOW_SECS: usize = 2;
-const MAX_AUDIO_WINDOW_SECS: usize = 4;
+const DEFAULT_MIN_INFER_INTERVAL: Duration = Duration::from_millis(900);
+const STREAMING_MIN_INFER_INTERVAL: Duration = Duration::from_millis(320);
+const DEFAULT_MIN_AUDIO_WINDOW_SECS: usize = 2;
+const STREAMING_MIN_AUDIO_WINDOW_SECS: usize = 1;
+const DEFAULT_MAX_AUDIO_WINDOW_SECS: usize = 4;
+const STREAMING_MAX_AUDIO_WINDOW_SECS: usize = 3;
 const MAX_AUDIO_BUFFER_SECS: usize = 10;
 const DRAIN_PER_POLL_SECS: usize = 2;
 const SILENCE_RMS_THRESHOLD: f32 = 0.010;
-const RETAIN_TAIL_SECS: usize = 2;
+const DEFAULT_RETAIN_TAIL_SECS: usize = 2;
+const STREAMING_RETAIN_TAIL_SECS: usize = 1;
+const STREAMING_REPLACE_WINDOW_MS: u64 = 4_800;
+const STREAMING_TOKEN_OVERLAP_THRESHOLD: f32 = 0.45;
 const INFERENCE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Serialize)]
@@ -43,12 +49,20 @@ pub struct LiveTranscriptLine {
     pub timestamp_ms: u64,
     pub source: SourceIcon,
     pub text: String,
+    pub mutation: LiveTranscriptMutation,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct LanguageConfig {
     pub source_language: Language,
     pub target_language: Language,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveTranscriptMutation {
+    Append,
+    ReplaceLast,
 }
 
 #[derive(Debug, Error)]
@@ -82,9 +96,12 @@ pub struct AppController {
     live_sample_rate_hz: u32,
     source_language: Language,
     target_language: Language,
+    streaming_translation_enabled: bool,
     listening_started_at: Option<Instant>,
     last_infer_at: Option<Instant>,
     last_emitted_normalized: Option<String>,
+    last_emitted_timestamp_ms: Option<u64>,
+    last_emitted_source: Option<SourceIcon>,
     pending_inference: bool,
     inference_request_tx: Option<mpsc::Sender<AsrRequest>>,
     inference_result_rx: Option<Receiver<Result<AsrOutput, AsrError>>>,
@@ -99,6 +116,7 @@ impl AppController {
         asr: Arc<dyn AsrRuntime>,
         capture: Arc<dyn CaptureBackend>,
         privacy: Arc<dyn PrivacyGuard>,
+        translator: Arc<dyn Translator>,
     ) -> Self {
         Self {
             session: SessionMachine::default(),
@@ -107,15 +125,18 @@ impl AppController {
             asr,
             capture,
             privacy,
-            translator: Arc::new(StubTranslator::default()),
+            translator,
             transcript: TranscriptBuffer::default(),
             live_audio_samples: VecDeque::new(),
             live_sample_rate_hz: 16_000,
             source_language: Language::Japanese,
             target_language: Language::English,
+            streaming_translation_enabled: false,
             listening_started_at: None,
             last_infer_at: None,
             last_emitted_normalized: None,
+            last_emitted_timestamp_ms: None,
+            last_emitted_source: None,
             pending_inference: false,
             inference_request_tx: None,
             inference_result_rx: None,
@@ -128,6 +149,7 @@ impl AppController {
         let settings = self.settings.load()?;
         self.source_language = language_from_code(settings.preferred_language_pair.input);
         self.target_language = language_from_code(settings.preferred_language_pair.output);
+        self.streaming_translation_enabled = settings.streaming_translation_enabled;
         self.capture
             .set_source_enabled(CaptureSource::Mic, settings.mic_enabled_by_default)?;
         self.capture.set_source_enabled(
@@ -146,15 +168,25 @@ impl AppController {
     }
 
     pub fn start_listening(&mut self) -> Result<SessionSnapshot, CoreError> {
-        self.privacy.enter_offline_mode()?;
-        if let Err(error) = self.capture.start() {
+        let offline_mode_required = !self.translator.uses_network() && !self.asr.uses_network();
+        if offline_mode_required {
+            self.privacy.enter_offline_mode()?;
+        } else {
             let _ = self.privacy.exit_offline_mode();
+        }
+
+        if let Err(error) = self.capture.start() {
+            if offline_mode_required {
+                let _ = self.privacy.exit_offline_mode();
+            }
             return Err(error.into());
         }
 
         if let Err(error) = self.session.start_listening() {
             let _ = self.capture.stop();
-            let _ = self.privacy.exit_offline_mode();
+            if offline_mode_required {
+                let _ = self.privacy.exit_offline_mode();
+            }
             return Err(error.into());
         }
 
@@ -163,6 +195,8 @@ impl AppController {
         self.listening_started_at = Some(Instant::now());
         self.last_infer_at = None;
         self.last_emitted_normalized = None;
+        self.last_emitted_timestamp_ms = None;
+        self.last_emitted_source = None;
         self.pending_inference = false;
         self.start_inference_worker();
 
@@ -199,11 +233,33 @@ impl AppController {
         }
     }
 
+    pub fn set_translator(&mut self, translator: Arc<dyn Translator>) {
+        self.translator = translator;
+    }
+
     pub fn language_config(&self) -> LanguageConfig {
         LanguageConfig {
             source_language: self.source_language,
             target_language: self.target_language,
         }
+    }
+
+    pub fn streaming_translation_enabled(&self) -> bool {
+        self.streaming_translation_enabled
+    }
+
+    pub fn set_streaming_translation_enabled(&mut self, enabled: bool) -> Result<bool, CoreError> {
+        self.streaming_translation_enabled = enabled;
+        self.last_emitted_normalized = None;
+        self.last_emitted_timestamp_ms = None;
+        self.last_emitted_source = None;
+        self.last_infer_at = None;
+
+        let mut settings = self.settings.load()?;
+        settings.streaming_translation_enabled = enabled;
+        self.settings.save(&settings)?;
+
+        Ok(self.streaming_translation_enabled)
     }
 
     pub fn set_language_config(
@@ -216,6 +272,8 @@ impl AppController {
         self.source_language = source_language;
         self.target_language = target_language;
         self.last_emitted_normalized = None;
+        self.last_emitted_timestamp_ms = None;
+        self.last_emitted_source = None;
 
         let mut settings = self.settings.load()?;
         settings.preferred_language_pair = SettingsLanguagePair {
@@ -237,9 +295,11 @@ impl AppController {
             }
         }
 
-        if let Err(error) = self.privacy.exit_offline_mode() {
-            self.session.fail(error.to_string());
-            return Err(error.into());
+        if !self.translator.uses_network() && !self.asr.uses_network() {
+            if let Err(error) = self.privacy.exit_offline_mode() {
+                self.session.fail(error.to_string());
+                return Err(error.into());
+            }
         }
 
         self.session.prompt_save_discard()?;
@@ -336,9 +396,18 @@ impl AppController {
             match result_rx.try_recv() {
                 Ok(result) => {
                     self.pending_inference = false;
-                    let output = result?;
-                    if let Some(line) = self.process_asr_output(output, sample_rate_hz)? {
-                        emitted_lines.push(line);
+                    match result {
+                        Ok(output) => {
+                            if let Some(line) = self.process_asr_output(output, sample_rate_hz)? {
+                                emitted_lines.push(line);
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("kiku asr inference error: {error}");
+                            let retain_tail_samples =
+                                sample_rate_hz as usize * self.retain_tail_secs();
+                            trim_to_tail(&mut self.live_audio_samples, retain_tail_samples);
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -355,19 +424,19 @@ impl AppController {
             return Ok(emitted_lines);
         }
 
-        let min_samples = sample_rate_hz as usize * MIN_AUDIO_WINDOW_SECS;
+        let min_samples = sample_rate_hz as usize * self.min_audio_window_secs();
         if self.live_audio_samples.len() < min_samples {
             return Ok(emitted_lines);
         }
 
         if let Some(last) = self.last_infer_at {
-            if last.elapsed() < MIN_INFER_INTERVAL {
+            if last.elapsed() < self.min_infer_interval() {
                 return Ok(emitted_lines);
             }
         }
 
-        let window_samples =
-            (sample_rate_hz as usize * MAX_AUDIO_WINDOW_SECS).min(self.live_audio_samples.len());
+        let window_samples = (sample_rate_hz as usize * self.max_audio_window_secs())
+            .min(self.live_audio_samples.len());
         let window_start = self.live_audio_samples.len() - window_samples;
         let inference_window: Vec<f32> = self
             .live_audio_samples
@@ -378,10 +447,8 @@ impl AppController {
 
         let rms = rms(&inference_window);
         if rms < SILENCE_RMS_THRESHOLD {
-            trim_to_tail(
-                &mut self.live_audio_samples,
-                sample_rate_hz as usize * RETAIN_TAIL_SECS,
-            );
+            let retain_tail_samples = sample_rate_hz as usize * self.retain_tail_secs();
+            trim_to_tail(&mut self.live_audio_samples, retain_tail_samples);
             return Ok(emitted_lines);
         }
 
@@ -418,6 +485,8 @@ impl AppController {
         self.listening_started_at = None;
         self.last_infer_at = None;
         self.last_emitted_normalized = None;
+        self.last_emitted_timestamp_ms = None;
+        self.last_emitted_source = None;
         self.pending_inference = false;
         self.stop_inference_worker();
     }
@@ -468,12 +537,10 @@ impl AppController {
         output: AsrOutput,
         sample_rate_hz: u32,
     ) -> Result<Option<LiveTranscriptLine>, CoreError> {
+        let retain_tail_samples = sample_rate_hz as usize * self.retain_tail_secs();
         let transcript = single_line(&output.transcript);
         if transcript.is_empty() {
-            trim_to_tail(
-                &mut self.live_audio_samples,
-                sample_rate_hz as usize * RETAIN_TAIL_SECS,
-            );
+            trim_to_tail(&mut self.live_audio_samples, retain_tail_samples);
             return Ok(None);
         }
 
@@ -484,31 +551,38 @@ impl AppController {
             .as_ref()
             .is_some_and(|last| last == &normalized)
         {
-            trim_to_tail(
-                &mut self.live_audio_samples,
-                sample_rate_hz as usize * RETAIN_TAIL_SECS,
-            );
+            trim_to_tail(&mut self.live_audio_samples, retain_tail_samples);
             return Ok(None);
         }
 
-        self.last_emitted_normalized = Some(normalized);
         let timestamp_ms = self
             .listening_started_at
             .map(|started| started.elapsed().as_millis() as u64)
             .unwrap_or(0);
         let source_icon = self.resolve_live_source_icon()?;
+        let mut mutation = LiveTranscriptMutation::Append;
 
-        self.transcript
-            .add_line(timestamp_ms, source_icon, rendered.clone());
-        trim_to_tail(
-            &mut self.live_audio_samples,
-            sample_rate_hz as usize * RETAIN_TAIL_SECS,
-        );
+        if self.should_replace_recent_line(&normalized, timestamp_ms, source_icon)
+            && self
+                .transcript
+                .replace_last_line(timestamp_ms, source_icon, rendered.clone())
+        {
+            mutation = LiveTranscriptMutation::ReplaceLast;
+        } else {
+            self.transcript
+                .add_line(timestamp_ms, source_icon, rendered.clone());
+        }
+
+        self.last_emitted_normalized = Some(normalized);
+        self.last_emitted_timestamp_ms = Some(timestamp_ms);
+        self.last_emitted_source = Some(source_icon);
+        trim_to_tail(&mut self.live_audio_samples, retain_tail_samples);
 
         Ok(Some(LiveTranscriptLine {
             timestamp_ms,
             source: source_icon,
             text: rendered,
+            mutation,
         }))
     }
 
@@ -529,9 +603,13 @@ impl AppController {
 
         let source = to_translation_language(self.source_language);
         let target = to_translation_language(self.target_language);
-        self.translator
-            .translate(transcript, source, target)
-            .map_err(Into::into)
+        match self.translator.translate(transcript, source, target) {
+            Ok(translated) => Ok(translated),
+            Err(error) => {
+                eprintln!("kiku translation fallback: {error}");
+                Ok(transcript.to_owned())
+            }
+        }
     }
 
     fn resolve_live_source_icon(&self) -> Result<SourceIcon, CoreError> {
@@ -542,6 +620,77 @@ impl AppController {
             (false, true) => SourceIcon::SystemAudio,
             _ => SourceIcon::Mic,
         })
+    }
+
+    fn min_infer_interval(&self) -> Duration {
+        if self.streaming_translation_enabled {
+            STREAMING_MIN_INFER_INTERVAL
+        } else {
+            DEFAULT_MIN_INFER_INTERVAL
+        }
+    }
+
+    fn min_audio_window_secs(&self) -> usize {
+        if self.streaming_translation_enabled {
+            STREAMING_MIN_AUDIO_WINDOW_SECS
+        } else {
+            DEFAULT_MIN_AUDIO_WINDOW_SECS
+        }
+    }
+
+    fn max_audio_window_secs(&self) -> usize {
+        if self.streaming_translation_enabled {
+            STREAMING_MAX_AUDIO_WINDOW_SECS
+        } else {
+            DEFAULT_MAX_AUDIO_WINDOW_SECS
+        }
+    }
+
+    fn retain_tail_secs(&self) -> usize {
+        if self.streaming_translation_enabled {
+            STREAMING_RETAIN_TAIL_SECS
+        } else {
+            DEFAULT_RETAIN_TAIL_SECS
+        }
+    }
+
+    fn should_replace_recent_line(
+        &self,
+        normalized: &str,
+        timestamp_ms: u64,
+        source_icon: SourceIcon,
+    ) -> bool {
+        if !self.streaming_translation_enabled {
+            return false;
+        }
+
+        let Some(last_normalized) = self.last_emitted_normalized.as_ref() else {
+            return false;
+        };
+        let Some(last_timestamp_ms) = self.last_emitted_timestamp_ms else {
+            return false;
+        };
+        let Some(last_source) = self.last_emitted_source else {
+            return false;
+        };
+
+        if last_source != source_icon {
+            return false;
+        }
+
+        if timestamp_ms.saturating_sub(last_timestamp_ms) > STREAMING_REPLACE_WINDOW_MS {
+            return false;
+        }
+
+        if normalized.starts_with(last_normalized)
+            || last_normalized.starts_with(normalized)
+            || normalized.contains(last_normalized)
+            || last_normalized.contains(normalized)
+        {
+            return true;
+        }
+
+        token_overlap_ratio(last_normalized, normalized) >= STREAMING_TOKEN_OVERLAP_THRESHOLD
     }
 }
 
@@ -581,6 +730,22 @@ fn normalize_for_dedupe(text: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn token_overlap_ratio(a: &str, b: &str) -> f32 {
+    let a_tokens: HashSet<&str> = a.split_whitespace().collect();
+    let b_tokens: HashSet<&str> = b.split_whitespace().collect();
+    if a_tokens.is_empty() || b_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let shared = a_tokens.intersection(&b_tokens).count();
+    let denom = a_tokens.len().max(b_tokens.len());
+    if denom == 0 {
+        0.0
+    } else {
+        shared as f32 / denom as f32
+    }
 }
 
 fn contains_japanese_script(text: &str) -> bool {
