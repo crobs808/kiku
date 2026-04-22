@@ -61,6 +61,7 @@ apps/desktop/src-tauri/icons/*
 local.properties
 *.keystore
 *.jks
+apps/desktop/src-tauri/.signing/
 *.iml
 captures/
 .externalNativeBuild/
