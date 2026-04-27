@@ -1001,10 +1001,15 @@ fn first_installed_package(model_root: &Path) -> Option<&'static ModelPackage> {
         .find(|package| is_model_package_installed(model_root, package))
 }
 
-fn resolve_active_model_id_for_root(model_root: &Path, active_model_id: Option<&str>) -> Option<String> {
+fn resolve_active_model_id_for_root(
+    model_root: &Path,
+    active_model_id: Option<&str>,
+) -> Option<String> {
     if let Some(active_model_id) = active_model_id {
         if let Some(active_package) = find_model_package(active_model_id) {
-            if active_package.is_installable() && is_model_package_installed(model_root, active_package) {
+            if active_package.is_installable()
+                && is_model_package_installed(model_root, active_package)
+            {
                 return Some(active_package.id.to_owned());
             }
         }

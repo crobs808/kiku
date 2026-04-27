@@ -829,11 +829,11 @@ fn android_start_system_audio_capture(sample_rate_hz: u32) -> CaptureResult<bool
         with_android_activity(env, |env, activity| {
             let result = env
                 .call_method(
-                activity,
-                "bridgeStartSystemAudioCapture",
-                "(I)Z",
-                &[JValue::Int(sample_rate_hz as jint)],
-            )
+                    activity,
+                    "bridgeStartSystemAudioCapture",
+                    "(I)Z",
+                    &[JValue::Int(sample_rate_hz as jint)],
+                )
                 .map_err(|error| {
                     CaptureError::AndroidSystemAudioBridge(format!(
                         "failed to call activity bridgeStartSystemAudioCapture: {error}"
