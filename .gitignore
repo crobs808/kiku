@@ -42,6 +42,26 @@ apps/desktop/ui/dist/*
 # Tauri build artifacts
 src-tauri/gen/
 **/src-tauri/gen/
+!apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/gen/*
+!apps/desktop/src-tauri/gen/android/
+apps/desktop/src-tauri/gen/android/*
+!apps/desktop/src-tauri/gen/android/app/
+apps/desktop/src-tauri/gen/android/app/*
+!apps/desktop/src-tauri/gen/android/app/src/
+apps/desktop/src-tauri/gen/android/app/src/*
+!apps/desktop/src-tauri/gen/android/app/src/main/
+apps/desktop/src-tauri/gen/android/app/src/main/*
+!apps/desktop/src-tauri/gen/android/app/src/main/AndroidManifest.xml
+!apps/desktop/src-tauri/gen/android/app/src/main/java/
+apps/desktop/src-tauri/gen/android/app/src/main/java/*
+!apps/desktop/src-tauri/gen/android/app/src/main/java/com/
+apps/desktop/src-tauri/gen/android/app/src/main/java/com/*
+!apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/
+apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/*
+!apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/desktop/
+apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/desktop/*
+!apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/desktop/MainActivity.kt
 *.app
 *.dmg
 *.pkg

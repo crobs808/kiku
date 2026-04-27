@@ -49,6 +49,7 @@ export type LanguageConfig = {
 };
 
 export type SystemAudioPermissionStatus = "granted" | "denied" | "unsupported";
+export type MicrophonePermissionStatus = "granted" | "denied" | "unsupported";
 export type AppRestartOutcome = "restarting" | "manual_required";
 export type AsrProvider = "local" | "google_cloud";
 export type TranslationProvider = "local" | "google_cloud";
@@ -395,6 +396,22 @@ export async function getSystemAudioPermissionStatus(): Promise<SystemAudioPermi
   }
 
   return invoke<SystemAudioPermissionStatus>("get_system_audio_permission_status");
+}
+
+export async function getMicrophonePermissionStatus(): Promise<MicrophonePermissionStatus> {
+  if (!inTauriRuntime()) {
+    return "granted";
+  }
+
+  return invoke<MicrophonePermissionStatus>("get_microphone_permission_status");
+}
+
+export async function requestMicrophonePermissionAccess(): Promise<MicrophonePermissionStatus> {
+  if (!inTauriRuntime()) {
+    return "granted";
+  }
+
+  return invoke<MicrophonePermissionStatus>("request_microphone_permission_access");
 }
 
 export async function requestSystemAudioPermissionAccess(): Promise<SystemAudioPermissionStatus> {

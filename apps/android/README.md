@@ -1,10 +1,15 @@
-# Android Shell (Planned)
+# Android Shell
 
-This directory is reserved for the Android Tauri shell planned for Phase 5.
+Android builds are currently driven by the Tauri mobile target in
+`apps/desktop/src-tauri` and packaged through:
 
-Planned initial scope:
+- `./scripts/release/build-android.sh apk release`
+- `./scripts/release/build-android.sh aab release`
 
-- mic-only capture flow
-- runtime permissions
-- mobile-adapted floating caption layout
-- reuse of Rust core/session/transcript/settings crates
+Current Android status:
+
+- signed alpha APK generation is working end-to-end
+- UI/session/model/cloud settings flows match desktop behavior
+- microphone permission flow is handled in `MainActivity.kt`
+- system playback-capture mode is implemented via `MediaProjection` + `AudioPlaybackCaptureConfiguration`
+- mobile icon source for Android/iOS builds is `assets/kiku-app-logo-mobile.png`

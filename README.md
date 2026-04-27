@@ -45,7 +45,7 @@ pnpm start
 
 `pnpm start` delegates to `apps/desktop` and currently runs:
 
-1. `pnpm run icon:sync` (refreshes Tauri icons from `assets/kiku-app-logo-aqua.png`)
+1. `pnpm run icon:sync:desktop` (refreshes Tauri desktop icons from `assets/kiku-app-logo-aqua.png`)
 2. `cargo clean -p kiku-desktop`
 3. `tauri dev`
 
@@ -84,6 +84,8 @@ Run these from repo root.
 - Android APK (debug): `pnpm build:android:apk:debug`
 - Android APK (release): `pnpm build:android:apk:release`
 - Android AAB (release): `pnpm build:android:aab:release`
+- iOS debug build: `pnpm build:ios:debug`
+- iOS release build: `pnpm build:ios:release`
 
 Convenience aliases:
 
@@ -91,6 +93,7 @@ Convenience aliases:
 - `pnpm build:win` -> `pnpm build:win:x64:exe`
 - `pnpm build:linux` -> `pnpm build:linux:x64:appimage`
 - `pnpm build:android` -> `pnpm build:android:apk:release`
+- `pnpm build:ios` -> `pnpm build:ios:release`
 
 ## Auto Semver For Installer Builds
 
@@ -143,7 +146,9 @@ VS Code integration:
 Notes:
 
 - Desktop packaging is most reliable on native OS runners (macOS for `.dmg`, Windows for `.exe`/`.msi`, Linux for `.AppImage`).
-- Android shell is currently scaffold-only in this repo; Android build commands are wired now and will fail with a clear message until `apps/android` is fully initialized.
+- Android builds run from `apps/desktop` via Tauri mobile target and now produce signed release APKs through `./scripts/release/build-android.sh`.
+- Mobile platform icons (Android/iOS) are generated from `assets/kiku-app-logo-mobile.png` via `pnpm icon:sync:mobile`.
+- Android uses the same UI/core session flow as desktop, including system playback-capture mode via Android `MediaProjection` permission flow.
 
 ## Local ASR Model (JP -> EN)
 

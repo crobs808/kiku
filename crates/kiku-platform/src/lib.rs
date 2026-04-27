@@ -1,4 +1,10 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(target_os = "android")]
+use jni::objects::{GlobalRef, JClass, JFloatArray, JObject, JString, JValue};
+#[cfg(target_os = "android")]
+use jni::sys::{jfloatArray, jint};
+#[cfg(target_os = "android")]
+use jni::JNIEnv;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 #[cfg(target_os = "macos")]
@@ -12,6 +18,8 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(target_os = "android")]
+use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -85,6 +93,8 @@ pub enum CaptureError {
     SystemAudioHelperLaunch(String),
     #[error("failed to initialize macOS system audio helper: {0}")]
     SystemAudioHelperInit(String),
+    #[error("failed to access Android system audio bridge: {0}")]
+    AndroidSystemAudioBridge(String),
     #[error("capture backend lock poisoned")]
     LockPoisoned,
 }
@@ -93,7 +103,7 @@ pub type CaptureResult<T> = Result<T, CaptureError>;
 
 const CAPTURE_SAMPLE_RATE_HZ: u32 = 16_000;
 const CAPTURE_RING_BUFFER_SECS: usize = 20;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 const LOOPBACK_STRONG_HINTS: [&str; 8] = [
     "blackhole",
     "loopback",
@@ -104,7 +114,7 @@ const LOOPBACK_STRONG_HINTS: [&str; 8] = [
     "system audio",
     "monitor",
 ];
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 const MIC_HINTS: [&str; 4] = ["microphone", "built-in mic", "external mic", "headset mic"];
 #[cfg(target_os = "macos")]
 const SYSTEM_AUDIO_HELPER_HEADER_LEN: usize = 8;
@@ -120,7 +130,12 @@ pub fn system_audio_permission_status() -> CaptureResult<SystemAudioPermissionSt
     run_macos_system_audio_helper_control("--permission-status")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "android")]
+pub fn system_audio_permission_status() -> CaptureResult<SystemAudioPermissionStatus> {
+    android_system_audio_permission_status()
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 pub fn system_audio_permission_status() -> CaptureResult<SystemAudioPermissionStatus> {
     Ok(SystemAudioPermissionStatus::Unsupported)
 }
@@ -130,9 +145,54 @@ pub fn request_system_audio_permission() -> CaptureResult<SystemAudioPermissionS
     run_macos_system_audio_helper_control("--request-permission")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "android")]
+pub fn request_system_audio_permission() -> CaptureResult<SystemAudioPermissionStatus> {
+    android_request_system_audio_permission()
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 pub fn request_system_audio_permission() -> CaptureResult<SystemAudioPermissionStatus> {
     Ok(SystemAudioPermissionStatus::Unsupported)
+}
+
+#[cfg(target_os = "android")]
+pub fn microphone_permission_status() -> CaptureResult<SystemAudioPermissionStatus> {
+    android_microphone_permission_status()
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn microphone_permission_status() -> CaptureResult<SystemAudioPermissionStatus> {
+    Ok(SystemAudioPermissionStatus::Unsupported)
+}
+
+#[cfg(target_os = "android")]
+pub fn request_microphone_permission() -> CaptureResult<SystemAudioPermissionStatus> {
+    android_request_microphone_permission()
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn request_microphone_permission() -> CaptureResult<SystemAudioPermissionStatus> {
+    Ok(SystemAudioPermissionStatus::Unsupported)
+}
+
+#[cfg(target_os = "android")]
+pub fn set_background_execution_keepalive(enabled: bool) -> CaptureResult<()> {
+    android_set_background_execution_keepalive(enabled)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_background_execution_keepalive(_enabled: bool) -> CaptureResult<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn set_screen_awake_for_download(enabled: bool) -> CaptureResult<()> {
+    android_set_screen_awake_for_download(enabled)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_screen_awake_for_download(_enabled: bool) -> CaptureResult<()> {
+    Ok(())
 }
 
 pub trait CaptureBackend: Send + Sync {
@@ -434,6 +494,10 @@ fn run_capture_worker(
     let mut streams = Vec::new();
     #[cfg(target_os = "macos")]
     let mut system_audio_helper_session: Option<MacOsSystemAudioHelperSession> = None;
+    #[cfg(target_os = "macos")]
+    let mut system_audio_helper_restart_attempted = false;
+    #[cfg(target_os = "android")]
+    let mut android_system_audio_session: Option<AndroidSystemAudioSession> = None;
 
     if mic_enabled {
         let stream = match build_mic_stream(level_bits.clone(), capture_samples.clone()) {
@@ -464,7 +528,20 @@ fn run_capture_worker(
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "android")]
+        {
+            match start_android_system_audio_capture(level_bits.clone(), capture_samples.clone()) {
+                Ok(session) => {
+                    android_system_audio_session = Some(session);
+                }
+                Err(error) => {
+                    let _ = started_tx.send(Err(error));
+                    return;
+                }
+            }
+        }
+
+        #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
         {
             let stream = match build_system_stream(level_bits.clone(), capture_samples.clone()) {
                 Ok(stream) => stream,
@@ -484,7 +561,9 @@ fn run_capture_worker(
 
     #[cfg(target_os = "macos")]
     let no_capture_session = streams.is_empty() && system_audio_helper_session.is_none();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "android")]
+    let no_capture_session = streams.is_empty() && android_system_audio_session.is_none();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
     let no_capture_session = streams.is_empty();
 
     if no_capture_session {
@@ -496,7 +575,39 @@ fn run_capture_worker(
     loop {
         match stop_rx.recv_timeout(Duration::from_millis(120)) {
             Ok(_) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(target_os = "macos")]
+                if system_audio_enabled {
+                    let helper_exited = system_audio_helper_session
+                        .as_mut()
+                        .map(|session| session.has_exited())
+                        .unwrap_or(false);
+                    if helper_exited {
+                        system_audio_helper_session = None;
+
+                        if !system_audio_helper_restart_attempted {
+                            system_audio_helper_restart_attempted = true;
+                            match start_macos_system_audio_helper(
+                                level_bits.clone(),
+                                capture_samples.clone(),
+                            ) {
+                                Ok(session) => {
+                                    eprintln!(
+                                        "kiku system helper: auto-restarted after unexpected exit"
+                                    );
+                                    system_audio_helper_session = Some(session);
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "kiku system helper: auto-restart failed after unexpected exit: {error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -504,6 +615,359 @@ fn run_capture_worker(
     drop(streams);
     #[cfg(target_os = "macos")]
     drop(system_audio_helper_session);
+    #[cfg(target_os = "android")]
+    drop(android_system_audio_session);
+}
+
+#[cfg(target_os = "android")]
+struct AndroidSystemAudioSink {
+    level_bits: Arc<AtomicU32>,
+    capture_samples: Arc<Mutex<VecDeque<f32>>>,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Default)]
+struct AndroidSystemAudioBridgeState {
+    sink: Mutex<Option<AndroidSystemAudioSink>>,
+    activity: Mutex<Option<GlobalRef>>,
+}
+
+#[cfg(target_os = "android")]
+static ANDROID_SYSTEM_AUDIO_BRIDGE: OnceLock<AndroidSystemAudioBridgeState> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+struct AndroidSystemAudioSession;
+
+#[cfg(target_os = "android")]
+impl Drop for AndroidSystemAudioSession {
+    fn drop(&mut self) {
+        let _ = android_stop_system_audio_capture();
+        set_android_system_audio_sink(None);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_system_audio_bridge_state() -> &'static AndroidSystemAudioBridgeState {
+    ANDROID_SYSTEM_AUDIO_BRIDGE.get_or_init(AndroidSystemAudioBridgeState::default)
+}
+
+#[cfg(target_os = "android")]
+fn set_android_system_audio_sink(sink: Option<AndroidSystemAudioSink>) {
+    if let Ok(mut guard) = android_system_audio_bridge_state().sink.lock() {
+        *guard = sink;
+    }
+}
+
+#[cfg(target_os = "android")]
+fn set_android_activity_instance(activity: GlobalRef) {
+    if let Ok(mut guard) = android_system_audio_bridge_state().activity.lock() {
+        *guard = Some(activity);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn with_android_activity<T>(
+    env: &mut JNIEnv<'_>,
+    op: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> CaptureResult<T>,
+) -> CaptureResult<T> {
+    let activity_ref = android_system_audio_bridge_state()
+        .activity
+        .lock()
+        .map_err(|_| {
+            CaptureError::AndroidSystemAudioBridge("activity bridge lock poisoned".to_owned())
+        })?
+        .as_ref()
+        .ok_or_else(|| {
+            CaptureError::AndroidSystemAudioBridge(
+                "android activity bridge is not initialized".to_owned(),
+            )
+        })?
+        .clone();
+
+    op(env, activity_ref.as_obj())
+}
+
+#[cfg(target_os = "android")]
+fn get_android_system_audio_sink() -> Option<(Arc<AtomicU32>, Arc<Mutex<VecDeque<f32>>>)> {
+    android_system_audio_bridge_state()
+        .sink
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard.as_ref().map(|sink| {
+                (
+                    Arc::clone(&sink.level_bits),
+                    Arc::clone(&sink.capture_samples),
+                )
+            })
+        })
+}
+
+#[cfg(target_os = "android")]
+fn with_android_jni_env<T>(
+    op: impl FnOnce(&mut JNIEnv<'_>) -> CaptureResult<T>,
+) -> CaptureResult<T> {
+    let android_context = ndk_context::android_context();
+    let vm_ptr = android_context.vm();
+    if vm_ptr.is_null() {
+        return Err(CaptureError::AndroidSystemAudioBridge(
+            "android vm pointer is null".to_owned(),
+        ));
+    }
+
+    let vm = unsafe { jni::JavaVM::from_raw(vm_ptr.cast()) }.map_err(|error| {
+        CaptureError::AndroidSystemAudioBridge(format!("failed to access JavaVM: {error}"))
+    })?;
+    let mut env = vm.attach_current_thread().map_err(|error| {
+        CaptureError::AndroidSystemAudioBridge(format!("failed to attach JNI thread: {error}"))
+    })?;
+    op(&mut env)
+}
+
+#[cfg(target_os = "android")]
+fn read_android_permission_status_method(
+    method_name: &str,
+) -> CaptureResult<SystemAudioPermissionStatus> {
+    with_android_jni_env(|env| {
+        with_android_activity(env, |env, activity| {
+            let status_value = env
+                .call_method(activity, method_name, "()Ljava/lang/String;", &[])
+                .map_err(|error| {
+                    CaptureError::AndroidSystemAudioBridge(format!(
+                        "failed to call activity {method_name}: {error}"
+                    ))
+                })?;
+            let status_obj = status_value.l().map_err(|error| {
+                CaptureError::AndroidSystemAudioBridge(format!(
+                    "{method_name} returned non-string: {error}"
+                ))
+            })?;
+            let status_jstring = JString::from(status_obj);
+            let status_raw: String = env
+                .get_string(&status_jstring)
+                .map_err(|error| {
+                    CaptureError::AndroidSystemAudioBridge(format!(
+                        "failed to decode status from {method_name}: {error}"
+                    ))
+                })?
+                .into();
+
+            parse_permission_status(&status_raw).ok_or_else(|| {
+                CaptureError::AndroidSystemAudioBridge(format!(
+                    "unexpected status from {method_name}: '{status_raw}'"
+                ))
+            })
+        })
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_system_audio_permission_status() -> CaptureResult<SystemAudioPermissionStatus> {
+    read_android_permission_status_method("bridgeSystemAudioPermissionStatus")
+}
+
+#[cfg(target_os = "android")]
+fn android_request_system_audio_permission() -> CaptureResult<SystemAudioPermissionStatus> {
+    read_android_permission_status_method("bridgeRequestSystemAudioPermission")
+}
+
+#[cfg(target_os = "android")]
+fn android_microphone_permission_status() -> CaptureResult<SystemAudioPermissionStatus> {
+    read_android_permission_status_method("bridgeMicrophonePermissionStatus")
+}
+
+#[cfg(target_os = "android")]
+fn android_request_microphone_permission() -> CaptureResult<SystemAudioPermissionStatus> {
+    read_android_permission_status_method("bridgeRequestMicrophonePermission")
+}
+
+#[cfg(target_os = "android")]
+fn android_set_background_execution_keepalive(enabled: bool) -> CaptureResult<()> {
+    with_android_jni_env(|env| {
+        let method_name = if enabled {
+            "bridgeAcquireBackgroundExecutionLock"
+        } else {
+            "bridgeReleaseBackgroundExecutionLock"
+        };
+        with_android_activity(env, |env, activity| {
+            env.call_method(activity, method_name, "()V", &[])
+                .map_err(|error| {
+                    CaptureError::AndroidSystemAudioBridge(format!(
+                        "failed to call activity {method_name}: {error}"
+                    ))
+                })
+                .map(|_| ())
+        })?;
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_set_screen_awake_for_download(enabled: bool) -> CaptureResult<()> {
+    with_android_jni_env(|env| {
+        with_android_activity(env, |env, activity| {
+            env.call_method(
+                activity,
+                "bridgeSetScreenAwakeForDownload",
+                "(Z)V",
+                &[JValue::Bool(enabled as u8)],
+            )
+            .map_err(|error| {
+                CaptureError::AndroidSystemAudioBridge(format!(
+                    "failed to call activity bridgeSetScreenAwakeForDownload: {error}"
+                ))
+            })
+            .map(|_| ())
+        })?;
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_start_system_audio_capture(sample_rate_hz: u32) -> CaptureResult<bool> {
+    with_android_jni_env(|env| {
+        with_android_activity(env, |env, activity| {
+            let result = env
+                .call_method(
+                activity,
+                "bridgeStartSystemAudioCapture",
+                "(I)Z",
+                &[JValue::Int(sample_rate_hz as jint)],
+            )
+                .map_err(|error| {
+                    CaptureError::AndroidSystemAudioBridge(format!(
+                        "failed to call activity bridgeStartSystemAudioCapture: {error}"
+                    ))
+                })?;
+            result.z().map_err(|error| {
+                CaptureError::AndroidSystemAudioBridge(format!(
+                    "invalid bridgeStartSystemAudioCapture return value: {error}"
+                ))
+            })
+        })
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_stop_system_audio_capture() -> CaptureResult<()> {
+    with_android_jni_env(|env| {
+        with_android_activity(env, |env, activity| {
+            env.call_method(activity, "bridgeStopSystemAudioCapture", "()V", &[])
+                .map_err(|error| {
+                    CaptureError::AndroidSystemAudioBridge(format!(
+                        "failed to call activity bridgeStopSystemAudioCapture: {error}"
+                    ))
+                })
+                .map(|_| ())
+        })?;
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn start_android_system_audio_capture(
+    level_bits: Arc<AtomicU32>,
+    capture_samples: Arc<Mutex<VecDeque<f32>>>,
+) -> CaptureResult<AndroidSystemAudioSession> {
+    match android_system_audio_permission_status()? {
+        SystemAudioPermissionStatus::Denied => {
+            return Err(CaptureError::SystemAudioPermissionDenied)
+        }
+        SystemAudioPermissionStatus::Unsupported => {
+            return Err(CaptureError::SystemAudioDeviceUnavailable)
+        }
+        SystemAudioPermissionStatus::Granted => {}
+    }
+
+    set_android_system_audio_sink(Some(AndroidSystemAudioSink {
+        level_bits,
+        capture_samples,
+    }));
+
+    let started = android_start_system_audio_capture(CAPTURE_SAMPLE_RATE_HZ);
+    match started {
+        Ok(true) => Ok(AndroidSystemAudioSession),
+        Ok(false) => {
+            set_android_system_audio_sink(None);
+            match android_system_audio_permission_status() {
+                Ok(SystemAudioPermissionStatus::Denied) => {
+                    Err(CaptureError::SystemAudioPermissionDenied)
+                }
+                Ok(SystemAudioPermissionStatus::Unsupported) => {
+                    Err(CaptureError::SystemAudioDeviceUnavailable)
+                }
+                _ => Err(CaptureError::SystemAudioStreamBuild(
+                    "failed to start Android playback audio capture".to_owned(),
+                )),
+            }
+        }
+        Err(error) => {
+            set_android_system_audio_sink(None);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_kiku_desktop_MainActivity_nativeRegisterActivityInstance(
+    env: JNIEnv<'_>,
+    activity: JObject<'_>,
+) {
+    if let Ok(global_ref) = env.new_global_ref(&activity) {
+        set_android_activity_instance(global_ref);
+    }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_kiku_desktop_MainActivity_nativeOnSystemAudioPcm(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    samples: jfloatArray,
+    sample_rate_hz: jint,
+    channel_count: jint,
+) {
+    let Some((sink_level_bits, sink_capture_samples)) = get_android_system_audio_sink() else {
+        return;
+    };
+
+    let samples_array = unsafe { JFloatArray::from_raw(samples) };
+    let sample_count = match env.get_array_length(&samples_array) {
+        Ok(length) if length > 0 => length as usize,
+        _ => return,
+    };
+
+    let mut input = vec![0.0f32; sample_count];
+    if env
+        .get_float_array_region(&samples_array, 0, &mut input)
+        .is_err()
+    {
+        return;
+    }
+
+    let channels = if channel_count <= 1 {
+        1u16
+    } else {
+        channel_count as u16
+    };
+    let mono = if channels == 1 {
+        input
+    } else {
+        interleaved_to_mono(input.into_iter(), channels)
+    };
+    let input_rate_hz = if sample_rate_hz <= 0 {
+        CAPTURE_SAMPLE_RATE_HZ
+    } else {
+        sample_rate_hz as u32
+    };
+
+    ingest_capture_samples(
+        mono,
+        input_rate_hz,
+        sink_level_bits.as_ref(),
+        sink_capture_samples.as_ref(),
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -511,6 +975,20 @@ struct MacOsSystemAudioHelperSession {
     child: Child,
     reader_handle: Option<thread::JoinHandle<()>>,
     stderr_handle: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsSystemAudioHelperSession {
+    fn has_exited(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("kiku system helper: failed to check process state: {error}");
+                true
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -651,9 +1129,8 @@ fn run_macos_system_audio_helper_control(arg: &str) -> CaptureResult<SystemAudio
     })
 }
 
-#[cfg(target_os = "macos")]
 fn parse_permission_status(raw: &str) -> Option<SystemAudioPermissionStatus> {
-    match raw.trim() {
+    match raw.trim().to_ascii_lowercase().as_str() {
         "granted" => Some(SystemAudioPermissionStatus::Granted),
         "denied" => Some(SystemAudioPermissionStatus::Denied),
         "unsupported" => Some(SystemAudioPermissionStatus::Unsupported),
@@ -869,7 +1346,7 @@ fn build_mic_stream(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn build_system_stream(
     level_bits: Arc<AtomicU32>,
     capture_samples: Arc<Mutex<VecDeque<f32>>>,
@@ -948,7 +1425,7 @@ fn build_system_stream(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn select_system_input_device(
     host: &cpal::Host,
 ) -> CaptureResult<(cpal::Device, cpal::SupportedStreamConfig)> {
@@ -997,7 +1474,7 @@ fn select_system_input_device(
     Err(CaptureError::SystemAudioDeviceUnavailable)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn find_input_device_by_name(
     host: &cpal::Host,
     target_name: &str,
@@ -1019,7 +1496,7 @@ fn find_input_device_by_name(
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn score_system_loopback_name(name: &str) -> i32 {
     let normalized = name.to_ascii_lowercase();
     let mut score = 0;

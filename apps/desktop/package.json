@@ -1,10 +1,12 @@
 {
   "name": "kiku-desktop-shell",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.1.9",
   "scripts": {
-    "icon:sync": "tauri icon ../../assets/kiku-app-logo-aqua.png",
-    "dev": "pnpm run icon:sync && cargo clean -p kiku-desktop && tauri dev",
+    "icon:sync": "pnpm run icon:sync:desktop",
+    "icon:sync:desktop": "tauri icon ../../assets/kiku-app-logo-aqua.png",
+    "icon:sync:mobile": "tauri icon ../../assets/kiku-app-logo-mobile.png",
+    "dev": "pnpm run icon:sync:desktop && cargo clean -p kiku-desktop && tauri dev",
     "build": "tauri build --bundles app,dmg"
   },
   "devDependencies": {

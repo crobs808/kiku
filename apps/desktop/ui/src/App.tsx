@@ -5,11 +5,13 @@ import {
   IntegrationSettings,
   LanguageConfig,
   LiveTranscriptLine,
+  MicrophonePermissionStatus,
   ModelDownloadProgress,
   ModelInventoryItem,
   ModelOption,
   SessionSnapshot,
   SystemAudioPermissionStatus,
+  getMicrophonePermissionStatus,
   cancelModelDownload,
   deleteModel,
   discardTranscript,
@@ -20,6 +22,7 @@ import {
   getModelDownloadProgress,
   getModelInventory,
   getSessionSnapshot,
+  requestMicrophonePermissionAccess,
   getStreamingTranslationEnabled,
   getSystemAudioPermissionStatus,
   getSourceState,
@@ -82,6 +85,14 @@ function normalizeIntegrationSettings(
 }
 
 const METER_SEGMENTS = 44;
+const ANDROID_PERMISSION_POLL_DELAY_MS = 220;
+const ANDROID_PERMISSION_POLL_ATTEMPTS = 24;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
 
 export function App() {
   const [snapshot, setSnapshot] = useState<SessionSnapshot>(defaultSnapshot);
@@ -115,7 +126,7 @@ export function App() {
   const [integrationSettingsDraft, setIntegrationSettingsDraft] =
     useState<IntegrationSettings>(defaultIntegrationSettings);
   const [integrationSaving, setIntegrationSaving] = useState(false);
-  const [phraseFlyoutOpen, setPhraseFlyoutOpen] = useState(true);
+  const [phraseFlyoutOpen, setPhraseFlyoutOpen] = useState(false);
   const [transcriptLines, setTranscriptLines] = useState<string[]>([]);
   const [pendingLineCount, setPendingLineCount] = useState(0);
   const [followLive, setFollowLive] = useState(true);
@@ -125,13 +136,15 @@ export function App() {
   const manualScrollArmedRef = useRef(false);
   const suppressScrollEventsRef = useRef(false);
   const systemPermissionStatusRef = useRef<SystemAudioPermissionStatus>("unsupported");
+  const microphonePermissionStatusRef = useRef<MicrophonePermissionStatus>("unsupported");
   const systemPermissionNeedsRestartRef = useRef(false);
+  const isAndroidRuntime = /android/i.test(window.navigator.userAgent);
 
   const isListening = snapshot.state === "listening";
   const isAwaitingDecision = snapshot.state === "prompting_save_discard";
   const isStopConfirmVisible = stopConfirmOpen && isListening;
   const isSystemPermissionModalVisible =
-    systemPermissionModalOpen && systemPermissionStatus !== "unsupported";
+    !isAndroidRuntime && systemPermissionModalOpen && systemPermissionStatus !== "unsupported";
   const isIntegrationModalVisible = integrationModalOpen;
   const isModelMissing = snapshot.state === "model_missing";
   const isDownloadingModel = snapshot.state === "downloading_model" || modelDownload.in_progress;
@@ -143,9 +156,13 @@ export function App() {
     () => modelInventory.filter((model) => model.installed),
     [modelInventory]
   );
-  const hasEnabledSource = micEnabled || systemEnabled;
+  const systemAudioSupported = systemPermissionStatus !== "unsupported";
+  const hasEnabledSource = micEnabled || (systemAudioSupported && systemEnabled);
   const systemPermissionBlocksListening =
-    systemEnabled && (systemPermissionStatus === "denied" || systemPermissionNeedsRestart);
+    !isAndroidRuntime &&
+    systemAudioSupported &&
+    systemEnabled &&
+    (systemPermissionStatus === "denied" || systemPermissionNeedsRestart);
   const hasInstalledModel =
     installedModels.length > 0 ||
     snapshot.state === "ready" ||
@@ -170,7 +187,7 @@ export function App() {
     !hasEnabledSource ||
     !hasInstalledModel;
   const canRestartForSystemPermission =
-    systemPermissionStatus === "granted" && systemPermissionNeedsRestart;
+    !isAndroidRuntime && systemPermissionStatus === "granted" && systemPermissionNeedsRestart;
   const stopActionDisabled = controlsLocked || isStopping;
   const listenButtonDisabled = isListening ? stopActionDisabled : startActionDisabled;
   const modelProgressPercent = Math.round(Math.max(0, Math.min(1, modelDownload.progress)) * 100);
@@ -178,24 +195,39 @@ export function App() {
     () => modelInventory.find((model) => model.active)?.id ?? null,
     [modelInventory]
   );
+  const activeModelName = useMemo(
+    () => modelInventory.find((model) => model.id === activeModelId)?.name ?? null,
+    [modelInventory, activeModelId]
+  );
   const currentModelName =
-    modelInventory.find((model) => model.id === activeModelId)?.name ??
-    modelDownload.model_name ??
-    "No model";
+    activeModelName ?? (isDownloadingModel ? modelDownload.model_name : null) ?? "No model installed";
   const selectedCatalogModel =
     modelCatalog.find((model) => model.id === selectedModelId) ?? null;
   const selectedModelDownloadable = selectedCatalogModel?.downloadable ?? false;
   const isModelSwitchDisabled = isDownloadingModel || modelActionPending !== false;
-  const isModelDeleteDisabled = isListening || isDownloadingModel || modelActionPending !== false;
+  const modelDeleteDisabledReason = isListening
+    ? "Stop listening before deleting installed models."
+    : isDownloadingModel
+      ? "Wait for model download to finish before deleting models."
+      : modelActionPending !== false
+        ? "Wait for the current model action to finish."
+        : null;
+  const isModelDeleteDisabled = modelDeleteDisabledReason !== null;
   const integrationRequiresKey =
     integrationSettingsDraft.asr_provider === "google_cloud" ||
     integrationSettingsDraft.translation_provider === "google_cloud";
   const integrationApiKey = integrationSettingsDraft.google_api_key ?? "";
-  const sourceModeSummary = getListeningSourceSummary(micEnabled, systemEnabled);
+  const sourceModeSummary = getListeningSourceSummary(
+    micEnabled,
+    systemEnabled,
+    systemAudioSupported
+  );
   const activeSystemPermissionWarning =
-    systemEnabled && systemPermissionStatus === "denied"
-      ? "System audio permission is not enabled yet. Use the startup prompt to enable Screen & System Audio Recording for Kiku."
-      : systemEnabled && systemPermissionNeedsRestart
+    systemAudioSupported && systemEnabled && systemPermissionStatus === "denied"
+      ? isAndroidRuntime
+        ? "System audio permission is not enabled yet. Use the permission prompt to allow playback capture."
+        : "System audio permission is not enabled yet. Use the startup prompt to enable Screen & System Audio Recording for Kiku."
+      : systemAudioSupported && systemEnabled && systemPermissionNeedsRestart
         ? "Screen & System Audio Recording was enabled. Restart Kiku to activate system audio capture."
         : null;
   const sourceModeReadyMessage = hasEnabledSource
@@ -254,6 +286,7 @@ export function App() {
     void refreshStreamingTranslationMode();
     void refreshModelCatalog();
     void refreshModelInventory(true);
+    void refreshMicrophonePermissionStatus();
     void ensureSystemAudioPermissionReadyOnStartup();
   }, []);
 
@@ -345,7 +378,14 @@ export function App() {
     setSystemPermissionNeedsRestart(next);
   }
 
-  function applySystemAudioPermissionStatus(next: SystemAudioPermissionStatus): void {
+  function applyMicrophonePermissionStatus(next: MicrophonePermissionStatus): void {
+    microphonePermissionStatusRef.current = next;
+  }
+
+  function applySystemAudioPermissionStatus(
+    next: SystemAudioPermissionStatus,
+    _mode: "startup" | "interactive" = "interactive"
+  ): void {
     const previous = systemPermissionStatusRef.current;
     systemPermissionStatusRef.current = next;
     setSystemPermissionStatus(next);
@@ -357,13 +397,18 @@ export function App() {
     }
 
     if (next === "denied") {
-      setSystemPermissionModalOpen(true);
+      setSystemPermissionModalOpen(!isAndroidRuntime);
       return;
     }
 
     if (previous === "denied" && next === "granted") {
-      setSystemPermissionNeedsRestartState(true);
-      setSystemPermissionModalOpen(true);
+      if (isAndroidRuntime) {
+        setSystemPermissionNeedsRestartState(false);
+        setSystemPermissionModalOpen(false);
+      } else {
+        setSystemPermissionNeedsRestartState(true);
+        setSystemPermissionModalOpen(true);
+      }
       return;
     }
 
@@ -374,10 +419,15 @@ export function App() {
     }
   }
 
-  async function refreshSystemAudioPermissionStatus(): Promise<SystemAudioPermissionStatus | null> {
+  async function refreshMicrophonePermissionStatus(): Promise<MicrophonePermissionStatus | null> {
+    if (!isAndroidRuntime) {
+      applyMicrophonePermissionStatus("unsupported");
+      return "unsupported";
+    }
+
     try {
-      const status = await getSystemAudioPermissionStatus();
-      applySystemAudioPermissionStatus(status);
+      const status = await getMicrophonePermissionStatus();
+      applyMicrophonePermissionStatus(status);
       setError(null);
       return status;
     } catch (requestError) {
@@ -386,17 +436,89 @@ export function App() {
     }
   }
 
+  async function refreshSystemAudioPermissionStatus(
+    mode: "startup" | "interactive" = "interactive"
+  ): Promise<SystemAudioPermissionStatus | null> {
+    try {
+      const status = await getSystemAudioPermissionStatus();
+      applySystemAudioPermissionStatus(status, mode);
+      setError(null);
+      return status;
+    } catch (requestError) {
+      setError(String(requestError));
+      return null;
+    }
+  }
+
+  async function requestAndroidMicrophonePermission(): Promise<MicrophonePermissionStatus | null> {
+    if (!isAndroidRuntime) {
+      return "unsupported";
+    }
+
+    try {
+      let status = await requestMicrophonePermissionAccess();
+      applyMicrophonePermissionStatus(status);
+      if (status === "granted") {
+        setError(null);
+        return status;
+      }
+
+      for (let attempt = 0; attempt < ANDROID_PERMISSION_POLL_ATTEMPTS; attempt += 1) {
+        await delay(ANDROID_PERMISSION_POLL_DELAY_MS);
+        status = await getMicrophonePermissionStatus();
+        applyMicrophonePermissionStatus(status);
+        if (status === "granted") {
+          setError(null);
+          return status;
+        }
+      }
+
+      return status;
+    } catch (requestError) {
+      setError(String(requestError));
+      return null;
+    }
+  }
+
+  async function requestAndroidSystemAudioPermission(): Promise<SystemAudioPermissionStatus | null> {
+    try {
+      let status = await requestSystemAudioPermissionAccess();
+      applySystemAudioPermissionStatus(status, "interactive");
+      if (!isAndroidRuntime || status === "granted") {
+        setError(null);
+        return status;
+      }
+
+      for (let attempt = 0; attempt < ANDROID_PERMISSION_POLL_ATTEMPTS; attempt += 1) {
+        await delay(ANDROID_PERMISSION_POLL_DELAY_MS);
+        const refreshed = await getSystemAudioPermissionStatus();
+        status = refreshed;
+        applySystemAudioPermissionStatus(status, "interactive");
+        if (status === "granted") {
+          setError(null);
+          return status;
+        }
+      }
+
+      return status;
+    } catch (requestError) {
+      setError(String(requestError));
+      return null;
+    }
+  }
+
   async function ensureSystemAudioPermissionReadyOnStartup(): Promise<void> {
-    const status = await refreshSystemAudioPermissionStatus();
+    const status = await refreshSystemAudioPermissionStatus("startup");
     if (status !== "denied") {
       return;
     }
 
-    try {
-      const requested = await requestSystemAudioPermissionAccess();
-      applySystemAudioPermissionStatus(requested);
-    } catch (requestError) {
-      setError(String(requestError));
+    if (isAndroidRuntime) {
+      try {
+        await requestAndroidSystemAudioPermission();
+      } catch (requestError) {
+        setError(String(requestError));
+      }
     }
   }
 
@@ -496,6 +618,69 @@ export function App() {
 
     setSessionActionPending("start");
     try {
+      if (isAndroidRuntime) {
+        if (micEnabled) {
+          let micStatus = microphonePermissionStatusRef.current;
+          if (micStatus === "unsupported") {
+            const refreshedMicStatus = await refreshMicrophonePermissionStatus();
+            micStatus = refreshedMicStatus ?? "denied";
+          }
+          if (micStatus === "denied") {
+            const requestedMicStatus = await requestAndroidMicrophonePermission();
+            micStatus = requestedMicStatus ?? "denied";
+          }
+          if (micStatus !== "granted") {
+            setError(
+              "Microphone permission is required. Tap Allow on the Android permission prompt, then tap Start Listening again."
+            );
+            return;
+          }
+        }
+
+        if (systemEnabled && systemAudioSupported) {
+          let systemStatus = systemPermissionStatusRef.current;
+          if (systemStatus === "unsupported") {
+            const refreshedSystemStatus = await refreshSystemAudioPermissionStatus();
+            systemStatus = refreshedSystemStatus ?? "denied";
+          }
+          if (systemStatus === "denied") {
+            const requestedSystemStatus = await requestAndroidSystemAudioPermission();
+            systemStatus = requestedSystemStatus ?? "denied";
+          }
+          if (systemStatus !== "granted") {
+            setError(
+              "System audio capture requires Android playback-capture consent. Accept the Android prompt, then tap Start Listening again."
+            );
+            return;
+          }
+        }
+      } else if (systemEnabled && systemAudioSupported) {
+        let systemStatus = systemPermissionStatusRef.current;
+        if (systemStatus === "unsupported") {
+          const refreshedSystemStatus = await refreshSystemAudioPermissionStatus();
+          systemStatus = refreshedSystemStatus ?? "denied";
+        }
+        if (systemStatus === "denied") {
+          const requestedSystemStatus = await requestSystemAudioPermissionAccess();
+          applySystemAudioPermissionStatus(requestedSystemStatus, "interactive");
+          systemStatus = requestedSystemStatus;
+        }
+        if (systemStatus !== "granted") {
+          setSystemPermissionModalOpen(true);
+          setError(
+            "System audio capture needs Screen & System Audio Recording permission. Allow it in the macOS prompt/settings, then restart Kiku."
+          );
+          return;
+        }
+        if (systemPermissionNeedsRestartRef.current) {
+          setSystemPermissionModalOpen(true);
+          setError(
+            "Screen & System Audio Recording was enabled while Kiku was running. Restart Kiku before starting system audio capture."
+          );
+          return;
+        }
+      }
+
       setSnapshot(await startListening());
       setSavedTranscript("");
       setTranscriptLines([]);
@@ -772,6 +957,22 @@ export function App() {
   }
 
   async function onToggleMic(): Promise<void> {
+    if (!micEnabled && isAndroidRuntime) {
+      let status = microphonePermissionStatusRef.current;
+      if (status === "unsupported") {
+        const refreshedStatus = await refreshMicrophonePermissionStatus();
+        status = refreshedStatus ?? "denied";
+      }
+      if (status === "denied") {
+        const requestedStatus = await requestAndroidMicrophonePermission();
+        status = requestedStatus ?? "denied";
+      }
+      if (status !== "granted") {
+        setError("Microphone permission is required before enabling Mic capture.");
+        return;
+      }
+    }
+
     try {
       const next = await setMicEnabled(!micEnabled);
       setMicEnabledLocal(next.mic_enabled);
@@ -783,12 +984,29 @@ export function App() {
   }
 
   async function onToggleSystem(): Promise<void> {
+    if (!systemAudioSupported) {
+      setError("System audio capture is not available on this platform yet.");
+      return;
+    }
+
     if (!systemEnabled) {
-      const permissionStatus = await refreshSystemAudioPermissionStatus();
+      let permissionStatus = await refreshSystemAudioPermissionStatus();
       if (permissionStatus === "denied") {
-        setSystemPermissionModalOpen(true);
+        if (isAndroidRuntime) {
+          permissionStatus = await requestAndroidSystemAudioPermission();
+        } else {
+          permissionStatus = await requestSystemAudioPermissionAccess();
+          if (permissionStatus !== null) {
+            applySystemAudioPermissionStatus(permissionStatus, "interactive");
+          }
+        }
+      }
+      if (permissionStatus === "denied") {
+        setSystemPermissionModalOpen(!isAndroidRuntime);
         setError(
-          "System audio capture needs Screen & System Audio Recording permission. Enable it in macOS settings, then restart Kiku."
+          isAndroidRuntime
+            ? "System audio capture needs Android playback-capture consent. Accept the prompt, then try again."
+            : "System audio capture needs Screen & System Audio Recording permission. Enable it in macOS settings, then restart Kiku."
         );
         return;
       }
@@ -832,8 +1050,12 @@ export function App() {
   async function onRequestSystemPermission(): Promise<void> {
     setPermissionActionPending("request");
     try {
-      const status = await requestSystemAudioPermissionAccess();
-      applySystemAudioPermissionStatus(status);
+      if (isAndroidRuntime) {
+        await requestAndroidSystemAudioPermission();
+      } else {
+        const status = await requestSystemAudioPermissionAccess();
+        applySystemAudioPermissionStatus(status);
+      }
       setError(null);
     } catch (requestError) {
       setError(String(requestError));
@@ -958,7 +1180,7 @@ export function App() {
   return (
     <>
       <main
-        className={`layout ${isAwaitingDecision || isStopConfirmVisible || isSystemPermissionModalVisible || isIntegrationModalVisible || isModelPromptVisible ? "modal-active" : ""} ${phraseFlyoutOpen ? "phrase-flyout-open" : ""}`}
+        className={`layout ${isAwaitingDecision || isStopConfirmVisible || isSystemPermissionModalVisible || isIntegrationModalVisible || isModelPromptVisible ? "modal-active" : ""}`}
       >
         <header className="topbar">
           <div className="topbar-left">
@@ -1089,7 +1311,8 @@ export function App() {
             <button
               className={`button toggle ${systemEnabled ? "active" : ""}`}
               onClick={onToggleSystem}
-              disabled={controlsLocked || isStopping}
+              disabled={controlsLocked || isStopping || !systemAudioSupported}
+              title={systemAudioSupported ? "Toggle system audio capture" : "System audio capture is unavailable on this platform"}
             >
               🔊 System
             </button>
@@ -1178,7 +1401,7 @@ export function App() {
                     ))}
                   </div>
                 </div>
-                <div className={`meter-row ${systemEnabled ? "" : "disabled"}`}>
+                <div className={`meter-row ${systemEnabled && systemAudioSupported ? "" : "disabled"}`}>
                   <span className="meter-label">SYS</span>
                   <div className="audio-meter" aria-label="system audio level meter">
                     {systemMeterSegments.map((segment) => (
@@ -1240,8 +1463,17 @@ export function App() {
           >
             <h2 id="system-permission-title">Enable System Audio Permission</h2>
             <p>
-              To capture app playback audio on macOS, Kiku needs access under{" "}
-              <strong>Privacy &amp; Security &gt; Screen &amp; System Audio Recording</strong>.
+              {isAndroidRuntime ? (
+                <>
+                  To capture app playback audio on Android, allow the system playback-capture
+                  prompt for Kiku.
+                </>
+              ) : (
+                <>
+                  To capture app playback audio on macOS, Kiku needs access under{" "}
+                  <strong>Privacy &amp; Security &gt; Screen &amp; System Audio Recording</strong>.
+                </>
+              )}
             </p>
             {systemPermissionNeedsRestart ? (
               <p className="permission-warning">
@@ -1255,10 +1487,13 @@ export function App() {
             )}
             <div className="permission-flow">
               <section className="permission-step">
-                <p className="permission-step-title">Step 1. Open macOS Settings</p>
+                <p className="permission-step-title">
+                  {isAndroidRuntime ? "Step 1. Open Permission Prompt" : "Step 1. Open macOS Settings"}
+                </p>
                 <p className="permission-step-note">
-                  Open Privacy &amp; Security. If deep-linking does not jump directly, navigate
-                  there manually.
+                  {isAndroidRuntime
+                    ? "Open the Android permission prompt and allow Kiku to capture playback audio."
+                    : "Open Privacy & Security. If deep-linking does not jump directly, navigate there manually."}
                 </p>
                 <div className="permission-step-actions">
                   <button
@@ -1266,7 +1501,7 @@ export function App() {
                     onClick={() => void onOpenSystemPermissionSettings()}
                     disabled={permissionActionPending !== null}
                   >
-                    Open Settings
+                    {isAndroidRuntime ? "Show Permission Prompt" : "Open Settings"}
                   </button>
                   {systemPermissionStatus === "denied" ? (
                     <button
@@ -1283,7 +1518,9 @@ export function App() {
               <section className="permission-step">
                 <p className="permission-step-title">Step 2. Enable Kiku Access</p>
                 <p className="permission-step-note">
-                  Turn on Kiku under Screen &amp; System Audio Recording, then return here.
+                  {isAndroidRuntime
+                    ? "After granting access, return here and refresh permission status."
+                    : "Turn on Kiku under Screen & System Audio Recording, then return here."}
                 </p>
                 <div className="permission-step-actions">
                   <button
@@ -1296,26 +1533,28 @@ export function App() {
                 </div>
               </section>
 
-              <section className="permission-step">
-                <p className="permission-step-title">Step 3. Restart Kiku</p>
-                <p className="permission-step-note">
-                  macOS applies this permission after app relaunch.
-                </p>
-                <div className="permission-step-actions">
-                  <button
-                    className="button secondary"
-                    onClick={() => void onRestartForSystemPermission()}
-                    disabled={!canRestartForSystemPermission || permissionActionPending !== null}
-                  >
-                    Restart Kiku
-                  </button>
-                </div>
-                {!canRestartForSystemPermission ? (
-                  <p className="permission-step-hint">
-                    Complete steps 1 and 2 first.
+              {!isAndroidRuntime ? (
+                <section className="permission-step">
+                  <p className="permission-step-title">Step 3. Restart Kiku</p>
+                  <p className="permission-step-note">
+                    macOS applies this permission after app relaunch.
                   </p>
-                ) : null}
-              </section>
+                  <div className="permission-step-actions">
+                    <button
+                      className="button secondary"
+                      onClick={() => void onRestartForSystemPermission()}
+                      disabled={!canRestartForSystemPermission || permissionActionPending !== null}
+                    >
+                      Restart Kiku
+                    </button>
+                  </div>
+                  {!canRestartForSystemPermission ? (
+                    <p className="permission-step-hint">
+                      Complete steps 1 and 2 first.
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
             </div>
 
             <div className="decision-buttons permission-footer">
@@ -1577,6 +1816,7 @@ export function App() {
                             void onDeleteModel(model.id);
                           }}
                           disabled={isModelDeleteDisabled}
+                          title={modelDeleteDisabledReason ?? undefined}
                         >
                           Delete
                         </button>
@@ -1590,6 +1830,9 @@ export function App() {
                 );
               })}
             </div>
+            {modelDeleteDisabledReason ? (
+              <p className="model-state-hint">{modelDeleteDisabledReason}</p>
+            ) : null}
 
             <div className="decision-buttons">
               <button
@@ -1684,15 +1927,22 @@ function getSessionStatus(state: SessionSnapshot["state"]): {
   }
 }
 
-function getListeningSourceSummary(micEnabled: boolean, systemEnabled: boolean): string {
+function getListeningSourceSummary(
+  micEnabled: boolean,
+  systemEnabled: boolean,
+  systemAudioSupported: boolean
+): string {
+  if (!systemAudioSupported && systemEnabled) {
+    return "System audio capture is unavailable on this platform in this build. Use microphone mode.";
+  }
   if (micEnabled && systemEnabled) {
-    return "Mic + System mode is active. Kiku will capture both microphone input and macOS playback audio.";
+    return "Mic + System mode is active. Kiku will capture both microphone input and playback audio.";
   }
   if (micEnabled) {
     return "Mic mode is active. Kiku will capture speech from your microphone.";
   }
   if (systemEnabled) {
-    return "System mode is active. Kiku will capture playback audio directly from macOS.";
+    return "System mode is active. Kiku will capture playback audio.";
   }
   return "No listening source is currently active.";
 }
