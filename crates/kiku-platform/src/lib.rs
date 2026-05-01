@@ -369,7 +369,7 @@ impl CpalCaptureBackend {
         }
 
         let worker_handle = thread::spawn(move || {
-            run_capture_worker(
+            run_capture_worker(CaptureWorkerArgs {
                 level_bits,
                 sample_rate_hz,
                 capture_samples,
@@ -378,7 +378,7 @@ impl CpalCaptureBackend {
                 started_tx,
                 mic_enabled,
                 system_audio_enabled,
-            )
+            })
         });
         let start_result = started_rx
             .recv()
@@ -538,7 +538,7 @@ impl CaptureBackend for CpalCaptureBackend {
     }
 }
 
-fn run_capture_worker(
+struct CaptureWorkerArgs {
     level_bits: Arc<AtomicU32>,
     sample_rate_hz: Arc<AtomicU32>,
     capture_samples: Arc<Mutex<VecDeque<f32>>>,
@@ -547,7 +547,20 @@ fn run_capture_worker(
     started_tx: mpsc::Sender<CaptureResult<()>>,
     mic_enabled: bool,
     system_audio_enabled: bool,
-) {
+}
+
+fn run_capture_worker(args: CaptureWorkerArgs) {
+    let CaptureWorkerArgs {
+        level_bits,
+        sample_rate_hz,
+        capture_samples,
+        mic_input_gain_bits,
+        stop_rx,
+        started_tx,
+        mic_enabled,
+        system_audio_enabled,
+    } = args;
+
     sample_rate_hz.store(CAPTURE_SAMPLE_RATE_HZ, Ordering::Relaxed);
 
     let mut streams = Vec::new();
