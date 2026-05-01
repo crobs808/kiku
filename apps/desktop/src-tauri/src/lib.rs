@@ -6,22 +6,29 @@ use kiku_core::{
 use kiku_models::InMemoryModelManager;
 use kiku_platform::{
     microphone_permission_status, request_microphone_permission, request_system_audio_permission,
-    set_background_execution_keepalive, set_screen_awake_for_download,
-    system_audio_permission_status, CaptureSource, CpalCaptureBackend, SystemAudioPermissionStatus,
+    set_background_execution_keepalive, set_foreground_activity_service_types,
+    set_screen_awake_for_download, system_audio_permission_status, CaptureSource,
+    CpalCaptureBackend, SystemAudioPermissionStatus,
 };
 use kiku_privacy::InMemoryPrivacyGuard;
 use kiku_settings::InMemorySettingsStore;
 use kiku_transcript::SourceIcon;
 use kiku_translate::{GoogleCloudTranslator, StubTranslator, Translator};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Manager, State};
 
 const MODEL_DOWNLOAD_CANCELLED: &str = "model download cancelled";
+const MODEL_DOWNLOAD_MAX_ATTEMPTS: usize = 6;
+const MODEL_DOWNLOAD_RETRY_BASE_DELAY_MS: u64 = 750;
+const FOREGROUND_ACTIVITY_TYPE_DATA_SYNC: u32 = 1 << 0;
+const FOREGROUND_ACTIVITY_TYPE_MICROPHONE: u32 = 1 << 1;
+const FOREGROUND_ACTIVITY_TYPE_MEDIA_PROJECTION: u32 = 1 << 2;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -296,6 +303,7 @@ struct DesktopState {
     model_root: PathBuf,
     active_model_id: Arc<Mutex<Option<String>>>,
     integration_settings: Arc<Mutex<IntegrationSettings>>,
+    activity_keepalive: ActivityKeepaliveController,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -338,28 +346,140 @@ impl ModelDownloadState {
     }
 }
 
-struct DownloadKeepaliveGuard;
+#[derive(Debug, Default)]
+struct ActivityKeepaliveState {
+    download_refs: usize,
+    listening_active: bool,
+    listening_mic_enabled: bool,
+    listening_system_audio_enabled: bool,
+    applied_background_active: bool,
+    applied_screen_awake: bool,
+    applied_foreground_types: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ActivityKeepaliveController {
+    inner: Arc<Mutex<ActivityKeepaliveState>>,
+}
+
+impl ActivityKeepaliveController {
+    fn note_download_started(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.download_refs += 1;
+            state.apply();
+        }
+    }
+
+    fn note_download_finished(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            if state.download_refs > 0 {
+                state.download_refs -= 1;
+            }
+            state.apply();
+        }
+    }
+
+    fn reconcile_session(&self, session_state: SessionState, sources: CaptureSourceState) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.listening_active = session_state == SessionState::Listening;
+            state.listening_mic_enabled = sources.mic_enabled;
+            state.listening_system_audio_enabled = sources.system_audio_enabled;
+            state.apply();
+        }
+    }
+
+    fn prearm_listening(&self, sources: CaptureSourceState) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.listening_active = true;
+            state.listening_mic_enabled = sources.mic_enabled;
+            state.listening_system_audio_enabled = sources.system_audio_enabled;
+            state.apply();
+        }
+    }
+}
+
+impl ActivityKeepaliveState {
+    fn desired_background_active(&self) -> bool {
+        self.download_refs > 0 || self.listening_active
+    }
+
+    fn desired_screen_awake(&self) -> bool {
+        self.download_refs > 0
+    }
+
+    fn desired_foreground_types(&self) -> u32 {
+        let mut types = 0u32;
+
+        if self.download_refs > 0 {
+            types |= FOREGROUND_ACTIVITY_TYPE_DATA_SYNC;
+        }
+        if self.listening_active && self.listening_mic_enabled {
+            types |= FOREGROUND_ACTIVITY_TYPE_MICROPHONE;
+        }
+        if self.listening_active && self.listening_system_audio_enabled {
+            types |= FOREGROUND_ACTIVITY_TYPE_MEDIA_PROJECTION;
+        }
+        if self.listening_active && types == 0 {
+            types |= FOREGROUND_ACTIVITY_TYPE_DATA_SYNC;
+        }
+
+        types
+    }
+
+    fn apply(&mut self) {
+        let desired_background_active = self.desired_background_active();
+        let desired_screen_awake = self.desired_screen_awake();
+        let desired_foreground_types = self.desired_foreground_types();
+
+        if desired_foreground_types != self.applied_foreground_types {
+            match set_foreground_activity_service_types(desired_foreground_types) {
+                Ok(()) => {
+                    self.applied_foreground_types = desired_foreground_types;
+                }
+                Err(error) => {
+                    eprintln!("failed to update foreground activity service types: {error}");
+                }
+            }
+        }
+
+        if desired_background_active != self.applied_background_active {
+            match set_background_execution_keepalive(desired_background_active) {
+                Ok(()) => {
+                    self.applied_background_active = desired_background_active;
+                }
+                Err(error) => {
+                    eprintln!("failed to update background execution keepalive: {error}");
+                }
+            }
+        }
+
+        if desired_screen_awake != self.applied_screen_awake {
+            match set_screen_awake_for_download(desired_screen_awake) {
+                Ok(()) => {
+                    self.applied_screen_awake = desired_screen_awake;
+                }
+                Err(error) => {
+                    eprintln!("failed to update screen-awake download lock: {error}");
+                }
+            }
+        }
+    }
+}
+
+struct DownloadKeepaliveGuard {
+    keepalive: ActivityKeepaliveController,
+}
 
 impl DownloadKeepaliveGuard {
-    fn acquire() -> Self {
-        if let Err(error) = set_background_execution_keepalive(true) {
-            eprintln!("failed to acquire background execution keepalive: {error}");
-        }
-        if let Err(error) = set_screen_awake_for_download(true) {
-            eprintln!("failed to keep screen awake for model download: {error}");
-        }
-        Self
+    fn acquire(keepalive: ActivityKeepaliveController) -> Self {
+        keepalive.note_download_started();
+        Self { keepalive }
     }
 }
 
 impl Drop for DownloadKeepaliveGuard {
     fn drop(&mut self) {
-        if let Err(error) = set_screen_awake_for_download(false) {
-            eprintln!("failed to release screen-awake lock for model download: {error}");
-        }
-        if let Err(error) = set_background_execution_keepalive(false) {
-            eprintln!("failed to release background execution keepalive: {error}");
-        }
+        self.keepalive.note_download_finished();
     }
 }
 
@@ -370,6 +490,9 @@ fn get_session_snapshot(state: State<DesktopState>) -> Result<SessionSnapshot, S
 
 #[tauri::command]
 fn start_listening(state: State<DesktopState>) -> Result<SessionSnapshot, String> {
+    if let Ok(sources) = with_controller(&state, |controller| controller.capture_source_state()) {
+        state.activity_keepalive.prearm_listening(sources);
+    }
     with_controller(&state, |controller| controller.start_listening())
 }
 
@@ -405,6 +528,16 @@ fn append_transcript_line(
 #[tauri::command]
 fn get_source_state(state: State<DesktopState>) -> Result<CaptureSourceState, String> {
     with_controller(&state, |controller| controller.capture_source_state())
+}
+
+#[tauri::command]
+fn get_mic_input_gain(state: State<DesktopState>) -> Result<f32, String> {
+    with_controller(&state, |controller| controller.mic_input_gain())
+}
+
+#[tauri::command]
+fn set_mic_input_gain(state: State<DesktopState>, gain: f32) -> Result<f32, String> {
+    with_controller(&state, |controller| controller.set_mic_input_gain(gain))
 }
 
 #[tauri::command]
@@ -768,11 +901,12 @@ fn start_model_download(
     let download_state = Arc::clone(&state.model_download);
     let active_model_id = Arc::clone(&state.active_model_id);
     let model_root = state.model_root.clone();
+    let activity_keepalive = state.activity_keepalive.clone();
     let model_path = state.model_root.join(selected_filename);
     let model_url = selected_url.to_owned();
     let selected_model_id = selected.id.to_owned();
     std::thread::spawn(move || {
-        let _download_keepalive = DownloadKeepaliveGuard::acquire();
+        let _download_keepalive = DownloadKeepaliveGuard::acquire(activity_keepalive);
         let download_result = download_model_file(&model_path, &model_url, &download_state)
             .and_then(|_| activate_installed_model(&controller, &model_path));
 
@@ -853,46 +987,120 @@ fn download_model_file(
             let _ = std::fs::remove_file(&temp_path);
         }
     };
-    cleanup_temp();
 
-    let result = (|| -> Result<(), String> {
+    if is_download_cancel_requested(download_state) {
+        cleanup_temp();
+        return Err(MODEL_DOWNLOAD_CANCELLED.to_owned());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("failed to create downloader: {error}"))?;
+
+    'attempts: for attempt in 1..=MODEL_DOWNLOAD_MAX_ATTEMPTS {
         if is_download_cancel_requested(download_state) {
+            cleanup_temp();
             return Err(MODEL_DOWNLOAD_CANCELLED.to_owned());
         }
 
-        let client = reqwest::blocking::Client::builder()
-            .build()
-            .map_err(|error| format!("failed to create downloader: {error}"))?;
-        let mut response = client
-            .get(model_url)
-            .send()
-            .map_err(|error| format!("model download failed: {error}"))?;
-
-        if !response.status().is_success() {
-            return Err(format!(
-                "model download failed with status {}",
-                response.status()
-            ));
+        let mut resume_from = partial_download_size(&temp_path)?;
+        let mut request = client.get(model_url);
+        if resume_from > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
         }
 
-        let total_bytes = response.content_length();
+        let mut response = match request.send() {
+            Ok(response) => response,
+            Err(error) => {
+                if attempt < MODEL_DOWNLOAD_MAX_ATTEMPTS {
+                    note_download_retry(download_state, attempt, &error.to_string());
+                    sleep_before_download_retry(attempt);
+                    continue;
+                }
+                return Err(format!(
+                    "model download failed after {MODEL_DOWNLOAD_MAX_ATTEMPTS} attempts: {error}"
+                ));
+            }
+        };
+
+        let status = response.status();
+        if resume_from > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            if let Some(total) = parse_total_bytes_from_content_range(&response) {
+                if total == resume_from {
+                    std::fs::rename(&temp_path, model_path)
+                        .map_err(|error| format!("failed to activate model file: {error}"))?;
+                    return Ok(());
+                }
+            }
+            cleanup_temp();
+            let status_error = format!("model download failed with status {status}");
+            if attempt < MODEL_DOWNLOAD_MAX_ATTEMPTS {
+                note_download_retry(download_state, attempt, &status_error);
+                sleep_before_download_retry(attempt);
+                continue;
+            }
+            return Err(status_error);
+        }
+
+        let append_mode = resume_from > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+        if resume_from > 0 && status == reqwest::StatusCode::OK {
+            resume_from = 0;
+        }
+        if !status.is_success() {
+            return Err(format!("model download failed with status {status}"));
+        }
+
+        let total_bytes = if append_mode {
+            parse_total_bytes_from_content_range(&response).or_else(|| {
+                response
+                    .content_length()
+                    .and_then(|remaining| remaining.checked_add(resume_from))
+            })
+        } else {
+            response.content_length()
+        };
+
+        let mut file = if append_mode {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&temp_path)
+                .map_err(|error| format!("failed to open model file: {error}"))?
+        } else {
+            std::fs::File::create(&temp_path)
+                .map_err(|error| format!("failed to open model file: {error}"))?
+        };
+
+        let mut downloaded_bytes = resume_from;
         if let Ok(mut download) = download_state.lock() {
             download.total_bytes = total_bytes;
+            download.downloaded_bytes = downloaded_bytes;
+            download.progress = calculate_download_progress(downloaded_bytes, total_bytes);
         }
 
-        let mut file = std::fs::File::create(&temp_path)
-            .map_err(|error| format!("failed to open model file: {error}"))?;
-        let mut downloaded_bytes = 0u64;
         let mut buffer = [0u8; 64 * 1024];
-
         loop {
             if is_download_cancel_requested(download_state) {
+                cleanup_temp();
                 return Err(MODEL_DOWNLOAD_CANCELLED.to_owned());
             }
 
-            let read_count = response
-                .read(&mut buffer)
-                .map_err(|error| format!("failed while downloading model: {error}"))?;
+            let read_count = match response.read(&mut buffer) {
+                Ok(read_count) => read_count,
+                Err(error) => {
+                    if attempt < MODEL_DOWNLOAD_MAX_ATTEMPTS {
+                        note_download_retry(download_state, attempt, &error.to_string());
+                        sleep_before_download_retry(attempt);
+                        continue 'attempts;
+                    }
+                    return Err(format!(
+                        "failed while downloading model after {MODEL_DOWNLOAD_MAX_ATTEMPTS} attempts: {error}"
+                    ));
+                }
+            };
+
             if read_count == 0 {
                 break;
             }
@@ -903,12 +1111,7 @@ fn download_model_file(
 
             if let Ok(mut download) = download_state.lock() {
                 download.downloaded_bytes = downloaded_bytes;
-                download.progress = match total_bytes {
-                    Some(total) if total > 0 => {
-                        (downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0)
-                    }
-                    _ => 0.0,
-                };
+                download.progress = calculate_download_progress(downloaded_bytes, total_bytes);
             }
         }
 
@@ -916,15 +1119,57 @@ fn download_model_file(
             .map_err(|error| format!("failed while finalizing model file: {error}"))?;
         std::fs::rename(&temp_path, model_path)
             .map_err(|error| format!("failed to activate model file: {error}"))?;
-
-        Ok(())
-    })();
-
-    if result.is_err() {
-        cleanup_temp();
+        return Ok(());
     }
 
-    result
+    Err(format!(
+        "model download failed after {MODEL_DOWNLOAD_MAX_ATTEMPTS} attempts"
+    ))
+}
+
+fn partial_download_size(path: &Path) -> Result<u64, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(format!(
+            "failed to inspect model download temp file: {error}"
+        )),
+    }
+}
+
+fn parse_total_bytes_from_content_range(response: &reqwest::blocking::Response) -> Option<u64> {
+    let content_range = response.headers().get(reqwest::header::CONTENT_RANGE)?;
+    let content_range = content_range.to_str().ok()?;
+    let (_, total) = content_range.rsplit_once('/')?;
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
+}
+
+fn calculate_download_progress(downloaded_bytes: u64, total_bytes: Option<u64>) -> f32 {
+    match total_bytes {
+        Some(total) if total > 0 => (downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0),
+        _ => 0.0,
+    }
+}
+
+fn note_download_retry(
+    download_state: &Arc<Mutex<ModelDownloadState>>,
+    attempt: usize,
+    error: &str,
+) {
+    if let Ok(mut download) = download_state.lock() {
+        let next_attempt = attempt + 1;
+        download.last_error = Some(format!(
+            "download interrupted, retrying (attempt {next_attempt}/{MODEL_DOWNLOAD_MAX_ATTEMPTS}): {error}"
+        ));
+    }
+}
+
+fn sleep_before_download_retry(attempt: usize) {
+    let backoff_ms = (MODEL_DOWNLOAD_RETRY_BASE_DELAY_MS * attempt as u64).min(5_000);
+    std::thread::sleep(Duration::from_millis(backoff_ms));
 }
 
 fn is_download_cancel_requested(download_state: &Arc<Mutex<ModelDownloadState>>) -> bool {
@@ -1136,7 +1381,18 @@ fn with_controller<T>(
         .lock()
         .map_err(|_| "controller lock poisoned".to_owned())?;
 
-    op(&mut controller).map_err(|error| error.to_string())
+    let result = op(&mut controller).map_err(|error| error.to_string());
+    let session_state = controller.session_snapshot().state;
+    let source_state = controller.capture_source_state().ok();
+    drop(controller);
+
+    if let Some(source_state) = source_state {
+        state
+            .activity_keepalive
+            .reconcile_session(session_state, source_state);
+    }
+
+    result
 }
 
 fn normalize_google_api_key(raw: &str) -> Option<String> {
@@ -1365,6 +1621,8 @@ pub fn run() {
             save_transcript,
             append_transcript_line,
             get_source_state,
+            get_mic_input_gain,
+            set_mic_input_gain,
             set_mic_enabled,
             set_system_audio_enabled,
             get_system_audio_permission_status,
@@ -1422,6 +1680,7 @@ pub fn run() {
                 model_root,
                 active_model_id: Arc::new(Mutex::new(initial_active_model_id)),
                 integration_settings: Arc::new(Mutex::new(integration_settings)),
+                activity_keepalive: ActivityKeepaliveController::default(),
             });
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]

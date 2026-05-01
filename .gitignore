@@ -62,6 +62,7 @@ apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/*
 !apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/desktop/
 apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/desktop/*
 !apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/desktop/MainActivity.kt
+!apps/desktop/src-tauri/gen/android/app/src/main/java/com/kiku/desktop/KikuForegroundService.kt
 *.app
 *.dmg
 *.pkg

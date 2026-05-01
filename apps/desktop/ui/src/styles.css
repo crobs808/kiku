@@ -593,6 +593,118 @@ textarea,
   padding: 8px 10px;
 }
 
+.mic-gain-dock {
+  position: absolute;
+  left: calc(10px + var(--safe-left));
+  bottom: calc(10px + var(--safe-bottom));
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 7px;
+}
+
+.mic-gain-toggle {
+  border: 1px solid rgba(154, 200, 229, 0.4);
+  border-radius: 999px;
+  background: rgba(8, 24, 35, 0.94);
+  color: #cbe6f8;
+  font-size: 0.7rem;
+  font-weight: 640;
+  padding: 0.3rem 0.62rem;
+  cursor: pointer;
+  transition: transform 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.mic-gain-toggle:hover {
+  transform: translateY(-1px);
+  border-color: rgba(173, 220, 244, 0.62);
+  color: #f0f9ff;
+}
+
+.mic-gain-panel {
+  width: min(320px, calc(100vw - 28px - var(--safe-left) - var(--safe-right)));
+  border: 1px solid rgba(154, 200, 229, 0.34);
+  border-radius: 10px;
+  background: rgba(8, 23, 34, 0.95);
+  box-shadow: 0 12px 26px rgba(3, 10, 16, 0.44);
+  padding: 8px 9px;
+  display: grid;
+  gap: 6px;
+}
+
+.mic-gain-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mic-gain-header p {
+  margin: 0;
+  font-size: 0.67rem;
+  font-weight: 650;
+  color: #d8edf9;
+}
+
+.mic-gain-header span {
+  font-size: 0.66rem;
+  color: #9fd3f3;
+  font-weight: 660;
+}
+
+.mic-gain-panel input[type="range"] {
+  --gain-progress: 0%;
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(137, 189, 220, 0.34);
+  background: linear-gradient(
+    90deg,
+    #8df1c8 0%,
+    #ffd48a var(--gain-progress),
+    rgba(30, 51, 64, 0.9) var(--gain-progress),
+    rgba(30, 51, 64, 0.9) 100%
+  );
+  outline: none;
+}
+
+.mic-gain-panel input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid rgba(219, 239, 252, 0.72);
+  background: #e4f5ff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.32);
+  cursor: pointer;
+}
+
+.mic-gain-panel input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid rgba(219, 239, 252, 0.72);
+  background: #e4f5ff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.32);
+  cursor: pointer;
+}
+
+.mic-gain-panel input[type="range"]::-moz-range-track {
+  height: 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(137, 189, 220, 0.34);
+  background: rgba(30, 51, 64, 0.9);
+}
+
+.mic-gain-note {
+  margin: 0;
+  font-size: 0.64rem;
+  color: #8fb9d4;
+}
+
 .visualizer-main {
   display: flex;
   align-items: center;

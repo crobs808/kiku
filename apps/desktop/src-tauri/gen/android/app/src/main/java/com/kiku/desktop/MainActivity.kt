@@ -3,6 +3,7 @@ package com.kiku.desktop
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioPlaybackCaptureConfiguration
@@ -41,6 +42,7 @@ class MainActivity : TauriActivity() {
   private var wifiWakeLock: WifiManager.WifiLock? = null
   private val screenAwakeLock = Any()
   private var screenAwakeRefCount = 0
+  private var foregroundServiceTypesMask = 0
 
   private val microphonePermissionLauncher =
     registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
@@ -96,6 +98,8 @@ class MainActivity : TauriActivity() {
     }
     synchronized(backgroundExecutionLock) {
       backgroundExecutionRefCount = 0
+      foregroundServiceTypesMask = 0
+      stopForegroundActivityServiceLocked()
       releaseBackgroundExecutionLockLocked()
     }
     synchronized(screenAwakeLock) {
@@ -181,6 +185,16 @@ class MainActivity : TauriActivity() {
     setScreenAwakeForDownload(enabled)
   }
 
+  @Keep
+  fun bridgeSetForegroundActivityServiceTypes(typesMask: Int) {
+    synchronized(backgroundExecutionLock) {
+      foregroundServiceTypesMask = typesMask
+      if (backgroundExecutionRefCount > 0) {
+        startOrUpdateForegroundActivityServiceLocked()
+      }
+    }
+  }
+
   private fun acquireBackgroundExecutionLock() {
     synchronized(backgroundExecutionLock) {
       backgroundExecutionRefCount += 1
@@ -213,6 +227,8 @@ class MainActivity : TauriActivity() {
         }
       }
       wifiWakeLock = nextWifiLock
+
+      startOrUpdateForegroundActivityServiceLocked()
     }
   }
 
@@ -223,8 +239,10 @@ class MainActivity : TauriActivity() {
       }
       backgroundExecutionRefCount -= 1
       if (backgroundExecutionRefCount > 0) {
+        startOrUpdateForegroundActivityServiceLocked()
         return
       }
+      stopForegroundActivityServiceLocked()
       releaseBackgroundExecutionLockLocked()
     }
   }
@@ -247,6 +265,48 @@ class MainActivity : TauriActivity() {
       }
     }
     wifiWakeLock = null
+  }
+
+  private fun startOrUpdateForegroundActivityServiceLocked() {
+    val serviceTypes = resolveForegroundServiceTypesLocked()
+    val statusText = when {
+      serviceTypes and ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION != 0 ->
+        "Listening with system audio capture active."
+      serviceTypes and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE != 0 ->
+        "Listening and transcribing in the background."
+      serviceTypes and ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC != 0 ->
+        "Downloading speech model in the background."
+      else -> "Running in the background."
+    }
+
+    try {
+      KikuForegroundService.startOrUpdate(applicationContext, serviceTypes, statusText)
+    } catch (_: Throwable) {
+    }
+  }
+
+  private fun stopForegroundActivityServiceLocked() {
+    try {
+      KikuForegroundService.stop(applicationContext)
+    } catch (_: Throwable) {
+    }
+  }
+
+  private fun resolveForegroundServiceTypesLocked(): Int {
+    var resolved = 0
+    if (foregroundServiceTypesMask and FOREGROUND_ACTIVITY_TYPE_DATA_SYNC != 0) {
+      resolved = resolved or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+    }
+    if (foregroundServiceTypesMask and FOREGROUND_ACTIVITY_TYPE_MICROPHONE != 0) {
+      resolved = resolved or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+    }
+    if (foregroundServiceTypesMask and FOREGROUND_ACTIVITY_TYPE_MEDIA_PROJECTION != 0) {
+      resolved = resolved or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+    }
+    if (resolved == 0) {
+      resolved = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+    }
+    return resolved
   }
 
   private fun setScreenAwakeForDownload(enabled: Boolean) {
@@ -497,6 +557,10 @@ class MainActivity : TauriActivity() {
   }
 
   companion object {
+    private const val FOREGROUND_ACTIVITY_TYPE_DATA_SYNC = 1 shl 0
+    private const val FOREGROUND_ACTIVITY_TYPE_MICROPHONE = 1 shl 1
+    private const val FOREGROUND_ACTIVITY_TYPE_MEDIA_PROJECTION = 1 shl 2
+
     @Volatile
     private var activeInstance: MainActivity? = null
 

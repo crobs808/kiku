@@ -18,6 +18,7 @@ import {
   getAudioLevel,
   getIntegrationSettings,
   getLanguageConfig,
+  getMicInputGain,
   getModelCatalog,
   getModelDownloadProgress,
   getModelInventory,
@@ -34,6 +35,7 @@ import {
   setActiveModel,
   setIntegrationSettings as saveIntegrationSettings,
   setLanguageConfig as setAsrLanguageConfig,
+  setMicInputGain,
   setStreamingTranslationEnabled as setStreamingTranslationMode,
   setMicEnabled,
   setSystemAudioEnabled,
@@ -87,6 +89,9 @@ function normalizeIntegrationSettings(
 const METER_SEGMENTS = 44;
 const ANDROID_PERMISSION_POLL_DELAY_MS = 220;
 const ANDROID_PERMISSION_POLL_ATTEMPTS = 24;
+const MIC_INPUT_GAIN_MIN = 0.5;
+const MIC_INPUT_GAIN_MAX = 5.0;
+const MIC_INPUT_GAIN_STEP = 0.1;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -130,6 +135,9 @@ export function App() {
   const [transcriptLines, setTranscriptLines] = useState<string[]>([]);
   const [pendingLineCount, setPendingLineCount] = useState(0);
   const [followLive, setFollowLive] = useState(true);
+  const [micInputGain, setMicInputGainState] = useState(2.5);
+  const [micGainOpen, setMicGainOpen] = useState(false);
+  const [micGainPending, setMicGainPending] = useState(false);
   const captionPanelRef = useRef<HTMLElement | null>(null);
   const isNearBottomRef = useRef(true);
   const followLiveRef = useRef(true);
@@ -138,6 +146,8 @@ export function App() {
   const systemPermissionStatusRef = useRef<SystemAudioPermissionStatus>("unsupported");
   const microphonePermissionStatusRef = useRef<MicrophonePermissionStatus>("unsupported");
   const systemPermissionNeedsRestartRef = useRef(false);
+  const micGainSaveTimerRef = useRef<number | null>(null);
+  const micGainRequestSeqRef = useRef(0);
   const isAndroidRuntime = /android/i.test(window.navigator.userAgent);
 
   const isListening = snapshot.state === "listening";
@@ -233,6 +243,10 @@ export function App() {
   const sourceModeReadyMessage = hasEnabledSource
     ? `${currentModelName} is active. Live ${formatLanguageLabel(languageConfig.source_language)} to ${formatLanguageLabel(languageConfig.target_language)} transcription is ready.`
     : "Enable Mic and/or System to start listening.";
+  const micGainPercent =
+    ((clampMicInputGain(micInputGain) - MIC_INPUT_GAIN_MIN) /
+      (MIC_INPUT_GAIN_MAX - MIC_INPUT_GAIN_MIN)) *
+    100;
 
   useEffect(() => {
     if (!isModelMissing && !isDownloadingModel) {
@@ -287,8 +301,18 @@ export function App() {
     void refreshModelCatalog();
     void refreshModelInventory(true);
     void refreshMicrophonePermissionStatus();
+    void refreshMicInputGain();
     void ensureSystemAudioPermissionReadyOnStartup();
   }, []);
+
+  useEffect(
+    () => () => {
+      if (micGainSaveTimerRef.current !== null) {
+        window.clearTimeout(micGainSaveTimerRef.current);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     if (!isModelPromptVisible) {
@@ -605,6 +629,15 @@ export function App() {
           setSelectedModelId(active);
         }
       }
+      setError(null);
+    } catch (requestError) {
+      setError(String(requestError));
+    }
+  }
+
+  async function refreshMicInputGain(): Promise<void> {
+    try {
+      setMicInputGainState(clampMicInputGain(await getMicInputGain()));
       setError(null);
     } catch (requestError) {
       setError(String(requestError));
@@ -1047,6 +1080,45 @@ export function App() {
     }
   }
 
+  function onToggleMicGainPanel(): void {
+    setMicGainOpen((open) => !open);
+  }
+
+  function onMicGainInput(nextRawGain: number): void {
+    const nextGain = clampMicInputGain(nextRawGain);
+    setMicInputGainState(nextGain);
+
+    if (micGainSaveTimerRef.current !== null) {
+      window.clearTimeout(micGainSaveTimerRef.current);
+    }
+    micGainSaveTimerRef.current = window.setTimeout(() => {
+      micGainSaveTimerRef.current = null;
+      void onCommitMicInputGain(nextGain);
+    }, 130);
+  }
+
+  async function onCommitMicInputGain(nextGain: number): Promise<void> {
+    const requestSeq = micGainRequestSeqRef.current + 1;
+    micGainRequestSeqRef.current = requestSeq;
+    setMicGainPending(true);
+
+    try {
+      const persistedGain = await setMicInputGain(nextGain);
+      if (requestSeq === micGainRequestSeqRef.current) {
+        setMicInputGainState(clampMicInputGain(persistedGain));
+      }
+      setError(null);
+    } catch (requestError) {
+      if (requestSeq === micGainRequestSeqRef.current) {
+        setError(String(requestError));
+      }
+    } finally {
+      if (requestSeq === micGainRequestSeqRef.current) {
+        setMicGainPending(false);
+      }
+    }
+  }
+
   async function onRequestSystemPermission(): Promise<void> {
     setPermissionActionPending("request");
     try {
@@ -1437,6 +1509,38 @@ export function App() {
               <p className="widget-subtitle">{isListening ? "Live input level" : "Waiting for input"}</p>
             </div>
           </div>
+        </section>
+
+        <section className={`mic-gain-dock ${micGainOpen ? "open" : ""}`} aria-label="microphone gain">
+          <button
+            className="mic-gain-toggle"
+            onClick={onToggleMicGainPanel}
+            aria-expanded={micGainOpen}
+            aria-controls="mic-gain-panel"
+          >
+            🎙 Gain {micGainOpen ? "▼" : "▲"}
+          </button>
+          {micGainOpen ? (
+            <div id="mic-gain-panel" className="mic-gain-panel">
+              <div className="mic-gain-header">
+                <p>Mic gain</p>
+                <span>{formatMicGain(micInputGain)}</span>
+              </div>
+              <input
+                type="range"
+                min={MIC_INPUT_GAIN_MIN}
+                max={MIC_INPUT_GAIN_MAX}
+                step={MIC_INPUT_GAIN_STEP}
+                value={clampMicInputGain(micInputGain)}
+                onChange={(event) => onMicGainInput(Number(event.currentTarget.value))}
+                aria-label="Microphone gain"
+                style={{ ["--gain-progress" as string]: `${micGainPercent}%` }}
+              />
+              <p className="mic-gain-note">
+                {micGainPending ? "Applying gain..." : "Increase if captions miss quiet speech."}
+              </p>
+            </div>
+          ) : null}
         </section>
 
         {savedTranscript ? (
@@ -1885,6 +1989,18 @@ function formatTimestamp(ms: number): string {
   return `${hours.toString().padStart(2, "0")}:${minutes
     .toString()
     .padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function clampMicInputGain(gain: number): number {
+  if (!Number.isFinite(gain)) {
+    return 1;
+  }
+
+  return Math.min(MIC_INPUT_GAIN_MAX, Math.max(MIC_INPUT_GAIN_MIN, gain));
+}
+
+function formatMicGain(gain: number): string {
+  return `${clampMicInputGain(gain).toFixed(1)}x`;
 }
 
 function formatSource(source: LiveTranscriptLine["source"]): string {

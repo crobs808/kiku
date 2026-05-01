@@ -1,7 +1,7 @@
 {
   "name": "kiku-desktop-shell",
   "private": true,
-  "version": "0.1.9",
+  "version": "0.1.11",
   "scripts": {
     "icon:sync": "pnpm run icon:sync:desktop",
     "icon:sync:desktop": "tauri icon ../../assets/kiku-app-logo-aqua.png",

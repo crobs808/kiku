@@ -95,6 +95,7 @@ const fallback: {
   snapshot: SessionSnapshot;
   sourceState: SourceState;
   audioLevel: number;
+  micInputGain: number;
   modelDownload: ModelDownloadProgress;
   languageConfig: LanguageConfig;
   streamingTranslationEnabled: boolean;
@@ -112,6 +113,7 @@ const fallback: {
     system_audio_enabled: false
   },
   audioLevel: 0,
+  micInputGain: 2.5,
   modelDownload: {
     in_progress: false,
     progress: 0,
@@ -531,6 +533,24 @@ export async function getAudioLevel(): Promise<number> {
   }
 
   return invoke<number>("get_audio_level");
+}
+
+export async function getMicInputGain(): Promise<number> {
+  if (!inTauriRuntime()) {
+    return fallback.micInputGain;
+  }
+
+  return invoke<number>("get_mic_input_gain");
+}
+
+export async function setMicInputGain(gain: number): Promise<number> {
+  if (!inTauriRuntime()) {
+    const clamped = Math.min(5, Math.max(0.5, gain));
+    fallback.micInputGain = Number.isFinite(clamped) ? clamped : fallback.micInputGain;
+    return fallback.micInputGain;
+  }
+
+  return invoke<number>("set_mic_input_gain", { gain });
 }
 
 export async function pollLiveTranscriptLines(): Promise<LiveTranscriptLine[]> {

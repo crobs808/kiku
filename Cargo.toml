@@ -16,7 +16,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.1.9"
+version = "0.1.11"
 license = "GPL-3.0-only"
 authors = ["Kiku Contributors"]
 
@@ -27,6 +27,8 @@ thiserror = "1.0"
 
 [patch.crates-io]
 cmake = { path = "third_party/cmake-0.1.58" }
+
+
 
 
 

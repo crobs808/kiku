@@ -103,6 +103,12 @@ pub type CaptureResult<T> = Result<T, CaptureError>;
 
 const CAPTURE_SAMPLE_RATE_HZ: u32 = 16_000;
 const CAPTURE_RING_BUFFER_SECS: usize = 20;
+#[cfg(target_os = "android")]
+const DEFAULT_MIC_INPUT_GAIN: f32 = 2.5;
+#[cfg(not(target_os = "android"))]
+const DEFAULT_MIC_INPUT_GAIN: f32 = 1.0;
+const MIC_INPUT_GAIN_MIN: f32 = 0.5;
+const MIC_INPUT_GAIN_MAX: f32 = 5.0;
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 const LOOPBACK_STRONG_HINTS: [&str; 8] = [
     "blackhole",
@@ -195,9 +201,21 @@ pub fn set_screen_awake_for_download(_enabled: bool) -> CaptureResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+pub fn set_foreground_activity_service_types(types_mask: u32) -> CaptureResult<()> {
+    android_set_foreground_activity_service_types(types_mask)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_foreground_activity_service_types(_types_mask: u32) -> CaptureResult<()> {
+    Ok(())
+}
+
 pub trait CaptureBackend: Send + Sync {
     fn set_source_enabled(&self, source: CaptureSource, enabled: bool) -> CaptureResult<()>;
     fn source_enabled(&self, source: CaptureSource) -> CaptureResult<bool>;
+    fn set_mic_input_gain(&self, gain: f32) -> CaptureResult<f32>;
+    fn mic_input_gain(&self) -> CaptureResult<f32>;
     fn start(&self) -> CaptureResult<()>;
     fn stop(&self) -> CaptureResult<()>;
     fn latest_level(&self) -> CaptureResult<f32>;
@@ -205,9 +223,19 @@ pub trait CaptureBackend: Send + Sync {
     fn drain_mic_samples(&self, max_samples: usize) -> CaptureResult<Vec<f32>>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NoopCaptureBackend {
     inner: Mutex<CaptureState>,
+    mic_input_gain_bits: AtomicU32,
+}
+
+impl Default for NoopCaptureBackend {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(CaptureState::default()),
+            mic_input_gain_bits: AtomicU32::new(DEFAULT_MIC_INPUT_GAIN.to_bits()),
+        }
+    }
 }
 
 impl CaptureBackend for NoopCaptureBackend {
@@ -229,6 +257,19 @@ impl CaptureBackend for NoopCaptureBackend {
                 CaptureSource::SystemAudio => state.system_audio_enabled,
             })
             .map_err(|_| CaptureError::LockPoisoned)
+    }
+
+    fn set_mic_input_gain(&self, gain: f32) -> CaptureResult<f32> {
+        let clamped = clamp_mic_input_gain(gain);
+        self.mic_input_gain_bits
+            .store(clamped.to_bits(), Ordering::Relaxed);
+        Ok(clamped)
+    }
+
+    fn mic_input_gain(&self) -> CaptureResult<f32> {
+        Ok(f32::from_bits(
+            self.mic_input_gain_bits.load(Ordering::Relaxed),
+        ))
     }
 
     fn start(&self) -> CaptureResult<()> {
@@ -290,6 +331,7 @@ pub struct CpalCaptureBackend {
     level_bits: Arc<AtomicU32>,
     sample_rate_hz: Arc<AtomicU32>,
     capture_samples: Arc<Mutex<VecDeque<f32>>>,
+    mic_input_gain_bits: Arc<AtomicU32>,
     inner: Mutex<CpalControlState>,
 }
 
@@ -299,6 +341,7 @@ impl Default for CpalCaptureBackend {
             level_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             sample_rate_hz: Arc::new(AtomicU32::new(CAPTURE_SAMPLE_RATE_HZ)),
             capture_samples: Arc::new(Mutex::new(VecDeque::new())),
+            mic_input_gain_bits: Arc::new(AtomicU32::new(DEFAULT_MIC_INPUT_GAIN.to_bits())),
             inner: Mutex::new(CpalControlState::default()),
         }
     }
@@ -317,6 +360,7 @@ impl CpalCaptureBackend {
         let level_bits = self.level_bits.clone();
         let sample_rate_hz = self.sample_rate_hz.clone();
         let capture_samples = self.capture_samples.clone();
+        let mic_input_gain_bits = self.mic_input_gain_bits.clone();
         self.level_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
         self.sample_rate_hz
             .store(CAPTURE_SAMPLE_RATE_HZ, Ordering::Relaxed);
@@ -329,6 +373,7 @@ impl CpalCaptureBackend {
                 level_bits,
                 sample_rate_hz,
                 capture_samples,
+                mic_input_gain_bits,
                 stop_rx,
                 started_tx,
                 mic_enabled,
@@ -426,6 +471,19 @@ impl CaptureBackend for CpalCaptureBackend {
             .map_err(|_| CaptureError::LockPoisoned)
     }
 
+    fn set_mic_input_gain(&self, gain: f32) -> CaptureResult<f32> {
+        let clamped = clamp_mic_input_gain(gain);
+        self.mic_input_gain_bits
+            .store(clamped.to_bits(), Ordering::Relaxed);
+        Ok(clamped)
+    }
+
+    fn mic_input_gain(&self) -> CaptureResult<f32> {
+        Ok(f32::from_bits(
+            self.mic_input_gain_bits.load(Ordering::Relaxed),
+        ))
+    }
+
     fn start(&self) -> CaptureResult<()> {
         let mut state = self.inner.lock().map_err(|_| CaptureError::LockPoisoned)?;
         if state.running {
@@ -484,6 +542,7 @@ fn run_capture_worker(
     level_bits: Arc<AtomicU32>,
     sample_rate_hz: Arc<AtomicU32>,
     capture_samples: Arc<Mutex<VecDeque<f32>>>,
+    mic_input_gain_bits: Arc<AtomicU32>,
     stop_rx: mpsc::Receiver<()>,
     started_tx: mpsc::Sender<CaptureResult<()>>,
     mic_enabled: bool,
@@ -500,7 +559,11 @@ fn run_capture_worker(
     let mut android_system_audio_session: Option<AndroidSystemAudioSession> = None;
 
     if mic_enabled {
-        let stream = match build_mic_stream(level_bits.clone(), capture_samples.clone()) {
+        let stream = match build_mic_stream(
+            level_bits.clone(),
+            capture_samples.clone(),
+            mic_input_gain_bits.clone(),
+        ) {
             Ok(stream) => stream,
             Err(error) => {
                 let _ = started_tx.send(Err(error));
@@ -815,6 +878,27 @@ fn android_set_screen_awake_for_download(enabled: bool) -> CaptureResult<()> {
             .map_err(|error| {
                 CaptureError::AndroidSystemAudioBridge(format!(
                     "failed to call activity bridgeSetScreenAwakeForDownload: {error}"
+                ))
+            })
+            .map(|_| ())
+        })?;
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_set_foreground_activity_service_types(types_mask: u32) -> CaptureResult<()> {
+    with_android_jni_env(|env| {
+        with_android_activity(env, |env, activity| {
+            env.call_method(
+                activity,
+                "bridgeSetForegroundActivityServiceTypes",
+                "(I)V",
+                &[JValue::Int(types_mask as jint)],
+            )
+            .map_err(|error| {
+                CaptureError::AndroidSystemAudioBridge(format!(
+                    "failed to call activity bridgeSetForegroundActivityServiceTypes: {error}"
                 ))
             })
             .map(|_| ())
@@ -1266,6 +1350,7 @@ fn prepare_macos_system_audio_helper() -> CaptureResult<PathBuf> {
 fn build_mic_stream(
     level_bits: Arc<AtomicU32>,
     capture_samples: Arc<Mutex<VecDeque<f32>>>,
+    mic_input_gain_bits: Arc<AtomicU32>,
 ) -> CaptureResult<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
@@ -1285,14 +1370,17 @@ fn build_mic_stream(
         cpal::SampleFormat::F32 => {
             let bits = level_bits.clone();
             let samples = capture_samples.clone();
+            let gain_bits = mic_input_gain_bits.clone();
             device
                 .build_input_stream(
                     &stream_config,
                     move |input: &[f32], _| {
+                        let input_gain = f32::from_bits(gain_bits.load(Ordering::Relaxed));
                         update_level_and_store_from_f32(
                             input,
                             channels,
                             input_sample_rate_hz,
+                            input_gain,
                             &bits,
                             &samples,
                         )
@@ -1305,14 +1393,17 @@ fn build_mic_stream(
         cpal::SampleFormat::I16 => {
             let bits = level_bits.clone();
             let samples = capture_samples.clone();
+            let gain_bits = mic_input_gain_bits.clone();
             device
                 .build_input_stream(
                     &stream_config,
                     move |input: &[i16], _| {
+                        let input_gain = f32::from_bits(gain_bits.load(Ordering::Relaxed));
                         update_level_and_store_from_i16(
                             input,
                             channels,
                             input_sample_rate_hz,
+                            input_gain,
                             &bits,
                             &samples,
                         )
@@ -1325,14 +1416,17 @@ fn build_mic_stream(
         cpal::SampleFormat::U16 => {
             let bits = level_bits.clone();
             let samples = capture_samples.clone();
+            let gain_bits = mic_input_gain_bits.clone();
             device
                 .build_input_stream(
                     &stream_config,
                     move |input: &[u16], _| {
+                        let input_gain = f32::from_bits(gain_bits.load(Ordering::Relaxed));
                         update_level_and_store_from_u16(
                             input,
                             channels,
                             input_sample_rate_hz,
+                            input_gain,
                             &bits,
                             &samples,
                         )
@@ -1344,6 +1438,14 @@ fn build_mic_stream(
         }
         _ => Err(CaptureError::MicUnsupportedSampleFormat),
     }
+}
+
+fn clamp_mic_input_gain(gain: f32) -> f32 {
+    if !gain.is_finite() {
+        return DEFAULT_MIC_INPUT_GAIN;
+    }
+
+    gain.clamp(MIC_INPUT_GAIN_MIN, MIC_INPUT_GAIN_MAX)
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
@@ -1372,6 +1474,7 @@ fn build_system_stream(
                             input,
                             channels,
                             input_sample_rate_hz,
+                            1.0,
                             &bits,
                             &samples,
                         )
@@ -1392,6 +1495,7 @@ fn build_system_stream(
                             input,
                             channels,
                             input_sample_rate_hz,
+                            1.0,
                             &bits,
                             &samples,
                         )
@@ -1412,6 +1516,7 @@ fn build_system_stream(
                             input,
                             channels,
                             input_sample_rate_hz,
+                            1.0,
                             &bits,
                             &samples,
                         )
@@ -1517,10 +1622,12 @@ fn update_level_and_store_from_f32(
     samples: &[f32],
     channels: u16,
     input_sample_rate_hz: u32,
+    input_gain: f32,
     level_bits: &AtomicU32,
     capture_samples: &Mutex<VecDeque<f32>>,
 ) {
-    let mono = interleaved_to_mono(samples.iter().copied(), channels);
+    let mut mono = interleaved_to_mono(samples.iter().copied(), channels);
+    apply_input_gain(&mut mono, input_gain);
     ingest_capture_samples(mono, input_sample_rate_hz, level_bits, capture_samples);
 }
 
@@ -1528,16 +1635,18 @@ fn update_level_and_store_from_i16(
     samples: &[i16],
     channels: u16,
     input_sample_rate_hz: u32,
+    input_gain: f32,
     level_bits: &AtomicU32,
     capture_samples: &Mutex<VecDeque<f32>>,
 ) {
-    let normalized = interleaved_to_mono(
+    let mut normalized = interleaved_to_mono(
         samples
             .iter()
             .copied()
             .map(|sample| sample as f32 / i16::MAX as f32),
         channels,
     );
+    apply_input_gain(&mut normalized, input_gain);
     ingest_capture_samples(
         normalized,
         input_sample_rate_hz,
@@ -1550,22 +1659,34 @@ fn update_level_and_store_from_u16(
     samples: &[u16],
     channels: u16,
     input_sample_rate_hz: u32,
+    input_gain: f32,
     level_bits: &AtomicU32,
     capture_samples: &Mutex<VecDeque<f32>>,
 ) {
-    let normalized = interleaved_to_mono(
+    let mut normalized = interleaved_to_mono(
         samples
             .iter()
             .copied()
             .map(|sample| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0),
         channels,
     );
+    apply_input_gain(&mut normalized, input_gain);
     ingest_capture_samples(
         normalized,
         input_sample_rate_hz,
         level_bits,
         capture_samples,
     );
+}
+
+fn apply_input_gain(samples: &mut [f32], gain: f32) {
+    if samples.is_empty() || (gain - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+
+    for sample in samples.iter_mut() {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
 }
 
 fn interleaved_to_mono(samples: impl Iterator<Item = f32>, channels: u16) -> Vec<f32> {

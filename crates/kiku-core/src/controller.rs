@@ -352,6 +352,14 @@ impl AppController {
         self.capture_source_state()
     }
 
+    pub fn set_mic_input_gain(&self, gain: f32) -> Result<f32, CoreError> {
+        self.capture.set_mic_input_gain(gain).map_err(Into::into)
+    }
+
+    pub fn mic_input_gain(&self) -> Result<f32, CoreError> {
+        self.capture.mic_input_gain().map_err(Into::into)
+    }
+
     pub fn capture_source_state(&self) -> Result<CaptureSourceState, CoreError> {
         Ok(CaptureSourceState {
             mic_enabled: self.capture.source_enabled(CaptureSource::Mic)?,
